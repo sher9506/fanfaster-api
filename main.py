@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -26,7 +27,7 @@ from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ───────────────────────── SOZLAMALAR ─────────────────────────
 API_KEY = os.environ.get("FANFASTER_API_KEY", "")
@@ -68,6 +69,19 @@ DEFAULT_PROMPT = (
     "KAZUS MATNI:\n{kazus}"
 )
 
+# Har bir so'rovga qo'shiladigan qoida: javob oxirida savol/taklif bo'lmasin.
+NO_QUESTION_RULE = (
+    "\n\nMUHIM QOIDA: Javobni xulosa bilan tugating. Javob oxirida foydalanuvchiga hech qanday savol bermang, "
+    "internetdan qidirishni yoki qo'shimcha yordam/ma'lumot taklif qilishni yozmang."
+)
+OFFER_HINTS = ("xohlaysizmi", "istaysizmi", "internet", "qidirib", "batafsilroq", "yordam beraman", "yordam bera olaman")
+BRAND_RE = re.compile(r"(?i)notebook\s?lm|gemini\s+notebook")
+URL_ONLY_RE = re.compile(r"^https?://\S+$", re.I)
+MAX_ARG_BYTES = 100_000   # Linux'da bitta buyruq argumenti ~128 KB dan oshmasligi kerak (UTF-8 baytlarda)
+PENDING_STATUSES = {"processing", "pending", "preparing", "indexing", "uploading", "importing"}
+BAD_STATUSES = {"error", "failed"}
+SOURCE_FAIL_MSG = "Manbalardan ba'zilarini ochib bo'lmadi. Havola o'rniga matnini «+ Matn» orqali qo'shing."
+
 TRANSIENT_WORDS = ("429", "rate", "quota", "limit", "timeout", "timed out", "temporar", "503", "500", "unavailable")
 AUTH_WORDS = ("auth", "login", "expired", "401", "403", "unauthorized", "sign in", "cookie")
 
@@ -78,6 +92,14 @@ class NlmError(Exception):
 
 class AuthError(NlmError):
     pass
+
+
+class SourceError(NlmError):
+    """Manba bilan bog'liq xato. `user_msg` ustozga ko'rsatilishi mumkin (brendsiz, neytral)."""
+
+    def __init__(self, user_msg: str, detail: str = ""):
+        super().__init__(detail or user_msg)
+        self.user_msg = user_msg
 
 
 # ───────────────────────── HOLAT ─────────────────────────
@@ -159,14 +181,35 @@ def clean_answer(raw: str) -> str:
         if not re.match(r"^\s*(Continuing conversation|Resumed conversation|Conversation:)", ln)
     ]
     txt = "\n".join(lines).strip()
-    return re.sub(r"^Answer:\s*", "", txt).strip()
+    txt = re.sub(r"^Answer:\s*", "", txt).strip()
+    txt = strip_trailing_offer(txt)
+    return BRAND_RE.sub("manba", txt)
+
+
+def strip_trailing_offer(txt: str) -> str:
+    """Javob oxiridagi "internetdan qidiraymi?" kabi savol/taklifni olib tashlaydi (oxirgi gap yoki 💡 abzats)."""
+    txt = txt.strip()
+    for _ in range(3):
+        paras = re.split(r"\n\s*\n", txt)
+        last = paras[-1].strip()
+        if len(paras) > 1 and last.startswith(("💡", "🔍")):
+            txt = "\n\n".join(paras[:-1]).strip()
+            continue
+        sents = re.split(r"(?<=[.!?])\s+", last)
+        tail = sents[-1].strip()
+        if tail.rstrip("*_ ").endswith("?") and any(h in tail.lower() for h in OFFER_HINTS):
+            rest = " ".join(sents[:-1]).strip()
+            txt = "\n\n".join(paras[:-1] + ([rest] if rest else [])).strip()
+            continue
+        break
+    return txt
 
 
 def delete_notebook(profile: str, nid: str) -> bool:
     """Faqat vaqtinchalik daftarni o'chiradi. Umumiy daftarlarga hech qachon tegmaydi."""
     if not nid or nid in UMUMIY_IDS:
         return False
-    for args in (("delete", nid), ("delete", "--notebook", nid)):
+    for args in (("delete", "--notebook", nid, "--yes"), ("delete", "--notebook", nid), ("delete", nid)):
         try:
             nlm(profile, *args, timeout=60, stdin="y\n")
             return True
@@ -180,7 +223,81 @@ def build_prompt(req: "KazusRequest") -> str:
     tpl = req.instruction or DEFAULT_PROMPT
     if "{kazus}" not in tpl:
         tpl = tpl + "\n\nKAZUS MATNI:\n{kazus}"
-    return tpl.replace("{kazus}", req.kazus_text)
+    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE
+
+
+def source_target(src: "Source"):
+    """Manba turini aniqlaydi: ("url", havola) yoki ("text", matn)."""
+    if src.url:
+        return "url", src.url.strip()
+    c = (src.content or "").strip()
+    if URL_ONLY_RE.match(c):     # eski format: content ichida faqat havola
+        return "url", c
+    return "text", c
+
+
+def add_source(p: str, nid: str, src: "Source") -> None:
+    kind, value = source_target(src)
+    title = (src.title or "Manba")[:120]
+    try:
+        if kind == "url":
+            with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "url",
+                                   "--timeout", "120", "--", value, timeout=300))
+        elif len(value.encode("utf-8")) <= MAX_ARG_BYTES:
+            # --type text: matn hech qachon serverdagi fayl yo'li deb talqin qilinmaydi
+            with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "text",
+                                   "--title", title, "--", value, timeout=300))
+        else:
+            # katta matn: argument o'lchami cheklovi sababli vaqtinchalik fayl orqali
+            fd, path = tempfile.mkstemp(suffix=".txt")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(value)
+                with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "file",
+                                       "--mime-type", "text/plain", "--title", title,
+                                       "--timeout", "180", "--", path, timeout=420))
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    except AuthError:
+        raise
+    except SourceError:
+        raise
+    except NlmError as e:
+        raise SourceError(SOURCE_FAIL_MSG, f"source add ({kind}, «{title}»): {e}")
+
+
+def source_statuses(p: str, nid: str) -> List[str]:
+    """`source list` jadvalidan har bir manbaning holatini (oxirgi ustun) o'qiydi."""
+    out = nlm(p, "source", "list", "--notebook", nid, timeout=60)
+    res = []
+    for line in out.splitlines():
+        if "│" not in line:
+            continue
+        cells = [c.strip() for c in line.split("│") if c.strip()]
+        if len(cells) >= 2:
+            res.append(cells[-1].lower())
+    return res
+
+
+def wait_sources_ready(p: str, nid: str, max_wait: int = 150) -> None:
+    """Manbalar tayyor bo'lguncha kutadi; xato holatdagi manba bo'lsa, ishni to'xtatadi."""
+    deadline = time.time() + max_wait
+    while True:
+        try:
+            st = source_statuses(p, nid)
+        except AuthError:
+            raise
+        except NlmError as e:
+            print(f"[wait_sources] {p}: holatni o'qib bo'lmadi: {e}")
+            return
+        if any(s in BAD_STATUSES for s in st):
+            raise SourceError(SOURCE_FAIL_MSG, f"manba holati xato: {st}")
+        if not any(s in PENDING_STATUSES for s in st) or time.time() > deadline:
+            return
+        time.sleep(5)
 
 
 def run_job(job: dict, acc: dict) -> dict:
@@ -196,10 +313,8 @@ def run_job(job: dict, acc: dict) -> dict:
                 raise NlmError(f"daftar ID topilmadi: {out[:200]}")
             nid, custom = m.group(0), True
             for src in req.sources[:MAX_SOURCES]:
-                if src.content.startswith(("http://", "https://")):
-                    with_retry(lambda s=src: nlm(p, "source", "add", "--notebook", nid, s.content, timeout=300))
-                else:
-                    with_retry(lambda s=src: nlm(p, "source", "add", "--notebook", nid, "--title", s.title or "Manba", s.content, timeout=300))
+                add_source(p, nid, src)
+            wait_sources_ready(p, nid)
 
         prompt = build_prompt(req)
         ask = lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420)
@@ -244,7 +359,9 @@ def worker(acc: dict):
         except Exception as e:  # noqa: BLE001
             STATS[p]["fail"] += 1
             STATS[p]["last_error"] = str(e)[:200]
-            job.update(status="error", finished=time.time(), error=str(e)[:500])
+            print(f"[job {job_id}] {p}: {e}")   # xom xato faqat serverda (ustozga ko'rsatilmaydi)
+            user_msg = getattr(e, "user_msg", None) or "Javob tayyorlanmadi. Qayta urinib ko'ring."
+            job.update(status="error", finished=time.time(), error=user_msg)
 
 
 def janitor():
@@ -287,8 +404,19 @@ def restore_cookies():
 
 # ───────────────────────── API ─────────────────────────
 class Source(BaseModel):
-    title: str = "Manba"
-    content: str
+    """Manba: yoki `url` (havola), yoki `content` (matn). Eski format ham ishlaydi:
+    content ichida faqat http(s) havola bo'lsa, havola sifatida olinadi."""
+    title: str = Field(default="Manba", max_length=200)
+    content: Optional[str] = Field(default=None, max_length=300000)
+    url: Optional[str] = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _check(self):
+        if not (self.url or (self.content and self.content.strip())):
+            raise ValueError("Manba uchun url yoki content kerak")
+        if self.url and not self.url.strip().lower().startswith(("http://", "https://")):
+            raise ValueError("url faqat http:// yoki https:// bo'lishi kerak")
+        return self
 
 
 class KazusRequest(BaseModel):

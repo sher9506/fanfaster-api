@@ -9,6 +9,7 @@ Ish tartibi:
     POST /api/jobs        -> darhol job_id qaytaradi (navbatga qo'yadi)
     GET  /api/jobs/{id}   -> holat: queued | running | done | error
 """
+import asyncio
 import base64
 import json
 import os
@@ -86,6 +87,7 @@ QUEUE: "queue.Queue[str]" = queue.Queue()
 
 UMUMIY_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}   # umumiy chatda javoblar aralashmasin
 GAP_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}
+REFRESH_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}
 LAST_CALL = {a["profile"]: 0.0 for a in ACCOUNTS}
 STATS = {
     a["profile"]: {"email": a["email"], "ok": 0, "fail": 0, "auth_ok": True, "last_error": None, "last_refresh": None}
@@ -94,7 +96,26 @@ STATS = {
 
 
 # ───────────────────────── CLI YORDAMCHILARI ─────────────────────────
-def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = None) -> str:
+def ensure_session(profile: str, force: bool = False) -> bool:
+    """storage_state.json yo'q (yoki majburan) bo'lsa, master token'dan cookie'ni qayta yasaydi."""
+    path = os.path.expanduser(f"~/.notebooklm/profiles/{profile}/storage_state.json")
+    with REFRESH_LOCKS[profile]:
+        if os.path.exists(path) and not force:
+            return True
+        try:
+            r = subprocess.run([NLM, "-p", profile, "auth", "refresh", "--quiet"],
+                               capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            print(f"[ensure_session] {profile}: timeout")
+            return False
+        if r.returncode != 0:
+            print(f"[ensure_session] {profile}: {(r.stderr or r.stdout).strip()[:300]}")
+            return False
+        STATS[profile]["last_refresh"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        return os.path.exists(path)
+
+
+def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = None, _retried: bool = False) -> str:
     """notebooklm CLI'ni bitta akkaunt (profil) nomidan chaqiradi. Chaqiruvlar orasida pauza qo'yadi."""
     with GAP_LOCKS[profile]:
         wait = MIN_GAP_SEC - (time.time() - LAST_CALL[profile])
@@ -108,6 +129,8 @@ def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = Non
     if r.returncode != 0:
         msg = (r.stderr or r.stdout or "noma'lum xato").strip()[:500]
         low = msg.lower()
+        if "not logged in" in low and not _retried and ensure_session(profile, force=True):
+            return nlm(profile, *args, timeout=timeout, stdin=stdin, _retried=True)
         if any(w in low for w in AUTH_WORDS):
             raise AuthError(msg)
         raise NlmError(msg)
@@ -217,7 +240,7 @@ def worker(acc: dict):
                 job["status"] = "queued"
                 QUEUE.put(job_id)
             else:
-                job.update(status="error", finished=time.time(), error="Google sessiyasi eskirgan (cookie). Qayta login kerak.")
+                job.update(status="error", finished=time.time(), error="AI xizmatiga ulanib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
         except Exception as e:  # noqa: BLE001
             STATS[p]["fail"] += 1
             STATS[p]["last_error"] = str(e)[:200]
@@ -286,6 +309,8 @@ def require_key(x_api_key: str = Header(default="")):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     restore_cookies()
+    for acc in ACCOUNTS:
+        await asyncio.to_thread(ensure_session, acc["profile"])
     for acc in ACCOUNTS:
         for _ in range(acc["workers"]):
             threading.Thread(target=worker, args=(acc,), daemon=True).start()

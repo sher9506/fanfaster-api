@@ -101,7 +101,8 @@ URL_ONLY_RE = re.compile(r"^https?://\S+$", re.I)
 MAX_ARG_BYTES = 100_000   # Linux'da bitta buyruq argumenti ~128 KB dan oshmasligi kerak (UTF-8 baytlarda)
 PENDING_STATUSES = {"processing", "pending", "preparing", "indexing", "uploading", "importing"}
 BAD_STATUSES = {"error", "failed"}
-SOURCE_FAIL_MSG = "Manbalardan ba'zilarini ochib bo'lmadi. Havola o'rniga matnini «+ Matn» orqali qo'shing."
+SOURCE_FAIL_URL_MSG = "Manbalardan ba'zilarini ochib bo'lmadi. Havola o'rniga matnini «+ Matn» orqali qo'shing."
+SOURCE_FAIL_TEXT_MSG = "Manbalardan ba'zilarini qo'shib bo'lmadi. Qayta urinib ko'ring."
 
 TRANSIENT_WORDS = ("429", "rate", "quota", "limit", "timeout", "timed out", "temporar", "503", "500", "unavailable")
 AUTH_WORDS = ("auth", "login", "expired", "401", "403", "unauthorized", "sign in", "cookie")
@@ -349,10 +350,11 @@ def is_source_failure(msg: str) -> bool:
 def add_source(p: str, nid: str, src: "Source") -> None:
     kind, value = source_target(src)
     title = (src.title or "Manba")[:120]
+    fail_msg = SOURCE_FAIL_URL_MSG if kind == "url" else SOURCE_FAIL_TEXT_MSG
     try:
         if kind == "url":
             with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "url",
-                                   "--timeout", "120", "--", value, timeout=300))
+                                   "--timeout", "180", "--", value, timeout=360))
         elif len(value.encode("utf-8")) <= MAX_ARG_BYTES:
             # --type text: matn hech qachon serverdagi fayl yo'li deb talqin qilinmaydi
             with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "text",
@@ -374,12 +376,12 @@ def add_source(p: str, nid: str, src: "Source") -> None:
     except AuthError as e:
         # "Failed to add source" / rpc_code=9 -- bu manbaning o'zi ochilmagani, akkaunt auth xatosi emas
         if is_source_failure(str(e)):
-            raise SourceError(SOURCE_FAIL_MSG, f"source add ({kind}, «{title}»): {e}")
+            raise SourceError(fail_msg, f"source add ({kind}, «{title}»): {e}")
         raise
     except SourceError:
         raise
     except NlmError as e:
-        raise SourceError(SOURCE_FAIL_MSG, f"source add ({kind}, «{title}»): {e}")
+        raise SourceError(fail_msg, f"source add ({kind}, «{title}»): {e}")
 
 
 def source_statuses(p: str, nid: str) -> List[str]:
@@ -395,19 +397,27 @@ def source_statuses(p: str, nid: str) -> List[str]:
     return res
 
 
-def wait_sources_ready(p: str, nid: str, max_wait: int = 150) -> None:
-    """Manbalar tayyor bo'lguncha kutadi; xato holatdagi manba bo'lsa, ishni to'xtatadi."""
+def wait_sources_ready(p: str, nid: str, max_wait: int = 180) -> None:
+    """Manbalar tayyor bo'lguncha kutadi; xato holatdagi manba bo'lsa, ishni to'xtatadi.
+    `source list` o'qib bo'lmasa, 3 marta qayta urinadi — xatolik bilan davom etmaydi."""
     deadline = time.time() + max_wait
+    read_errors = 0
     while True:
         try:
             st = source_statuses(p, nid)
+            read_errors = 0
         except AuthError:
             raise
         except NlmError as e:
-            print(f"[wait_sources] {p}: holatni o'qib bo'lmadi: {e}")
-            return
+            read_errors += 1
+            print(f"[wait_sources] {p}: holatni o'qib bo'lmadi ({read_errors}/3): {e}")
+            if read_errors >= 3:
+                raise SourceError(SOURCE_FAIL_TEXT_MSG, f"source list 3 marta xato: {e}")
+            time.sleep(5)
+            continue
         if any(s in BAD_STATUSES for s in st):
-            raise SourceError(SOURCE_FAIL_MSG, f"manba holati xato: {st}")
+            raise SourceError(SOURCE_FAIL_URL_MSG if any("url" in s for s in st) else SOURCE_FAIL_TEXT_MSG,
+                              f"manba holati xato: {st}")
         if not any(s in PENDING_STATUSES for s in st) or time.time() > deadline:
             return
         time.sleep(5)

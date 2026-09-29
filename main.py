@@ -78,6 +78,12 @@ LATIN_RULE = (
     "\nJavobni to'liq o'zbek LOTIN yozuvida yozing. Manba kirill yozuvida bo'lsa ham, undagi iboralarni lotin alifbosiga o'tkazib yozing; "
     "javobda kirill harflari bo'lmasin."
 )
+ACCURACY_RULE = (
+    "\n\nANIQLIK: Modda, qism va band raqamlarini faqat manbadagi matndan tekshirib yozing, xotiradan yozmang. "
+    "Manbada aniq topilmasa, taxmin qilmang, 'manbada aniq ko'rsatilmagan' deb yozing. "
+    "Qism yoki bandni tanlashdan oldin kazus faktlarini uning shartlari bilan solishtiring "
+    "(qurbonlar soni, zarar miqdori, usul, oqibat). Yozib bo'lgach, har bir raqamni manba bilan qayta tekshiring."
+)
 OFFER_HINTS = ("xohlaysizmi", "istaysizmi", "internet", "qidirib", "batafsilroq", "yordam beraman", "yordam bera olaman")
 BRAND_RE = re.compile(r"(?i)notebook\s?lm|gemini\s+notebook")
 # Ustozga ko'rinmasligi kerak bo'lgan ichki so'zlar (daftar, baza, brend). Shunday so'z bor gap butunlay olib tashlanadi.
@@ -185,17 +191,18 @@ def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = Non
     return r.stdout.strip()
 
 
-def with_retry(fn):
+def with_retry(fn, retries: Optional[int] = None):
     """Vaqtinchalik (limit/timeout) xatolarda kutib qayta urinadi."""
     delay = 10
-    for attempt in range(MAX_RETRIES + 1):
+    n = MAX_RETRIES if retries is None else retries
+    for attempt in range(n + 1):
         try:
             return fn()
         except AuthError:
             raise
         except NlmError as e:
             transient = any(w in str(e).lower() for w in TRANSIENT_WORDS)
-            if not transient or attempt == MAX_RETRIES:
+            if not transient or attempt == n:
                 raise
             time.sleep(delay)
             delay *= 3
@@ -329,7 +336,7 @@ def build_prompt(req: "KazusRequest") -> str:
     tpl = req.instruction or DEFAULT_PROMPT
     if "{kazus}" not in tpl:
         tpl = tpl + "\n\nKAZUS MATNI:\n{kazus}"
-    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE + LATIN_RULE
+    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE + LATIN_RULE + ACCURACY_RULE
 
 
 def source_target(src: "Source"):
@@ -353,11 +360,11 @@ def add_source(p: str, nid: str, src: "Source") -> None:
     fail_msg = SOURCE_FAIL_URL_MSG if kind == "url" else SOURCE_FAIL_TEXT_MSG
     try:
         if kind == "url":
-            with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "url",
+            with_retry(retries=1, fn=lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "url",
                                    "--timeout", "180", "--", value, timeout=360))
         elif len(value.encode("utf-8")) <= MAX_ARG_BYTES:
             # --type text: matn hech qachon serverdagi fayl yo'li deb talqin qilinmaydi
-            with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "text",
+            with_retry(retries=1, fn=lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "text",
                                    "--title", title, "--", value, timeout=300))
         else:
             # katta matn: argument o'lchami cheklovi sababli vaqtinchalik fayl orqali
@@ -365,7 +372,7 @@ def add_source(p: str, nid: str, src: "Source") -> None:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(value)
-                with_retry(lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "file",
+                with_retry(retries=1, fn=lambda: nlm(p, "source", "add", "--notebook", nid, "--type", "file",
                                        "--mime-type", "text/plain", "--title", title,
                                        "--timeout", "180", "--", path, timeout=420))
             finally:
@@ -418,27 +425,65 @@ def wait_sources_ready(p: str, nid: str, max_wait: int = 180) -> None:
         if any(s in BAD_STATUSES for s in st):
             raise SourceError(SOURCE_FAIL_URL_MSG if any("url" in s for s in st) else SOURCE_FAIL_TEXT_MSG,
                               f"manba holati xato: {st}")
-        if not any(s in PENDING_STATUSES for s in st) or time.time() > deadline:
+        if not any(s in PENDING_STATUSES for s in st):
             return
+        if time.time() > deadline:
+            raise SourceError(SOURCE_FAIL_TEXT_MSG, f"manbalar {max_wait}s ichida tayyor bo'lmadi: {st}")
         time.sleep(5)
+
+
+def group_sources(sources: List["Source"], max_chars: int = 250_000) -> List["Source"]:
+    """Havolalar o'z holicha; matn manbalari ~250 ming belgilik bir nechta katta manbaga birlashtiriladi
+    (15 ta chaqiruv o'rniga 5-6 ta: tezroq va RAM kamroq)."""
+    urls = [x for x in sources if source_target(x)[0] == "url"]
+    texts = [(x.title or "Manba", source_target(x)[1]) for x in sources if source_target(x)[0] == "text"]
+    groups, cur, size = [], [], 0
+    for title, body in texts:
+        piece = f"===== {title} =====\n{body}"
+        if cur and size + len(piece) > max_chars:
+            groups.append(cur)
+            cur, size = [], 0
+        cur.append(piece)
+        size += len(piece)
+    if cur:
+        groups.append(cur)
+    merged = [Source.model_construct(title=f"Manba {i + 1}", content="\n\n".join(g), url=None)
+              for i, g in enumerate(groups)]
+    return urls + merged
 
 
 def run_job(job: dict, acc: dict) -> dict:
     p = acc["profile"]
     req: KazusRequest = job["req"]
+    jid = job.get("id", "?")
     nid = acc["umumiy"]
     custom = False
+    t0 = time.time()
+
+    def step(msg: str):
+        print(f"[step] job={jid} {p} +{time.time() - t0:.0f}s {msg}", flush=True)
+
     try:
         if req.sources:
+            step(f"daftar yaratilyapti ({len(req.sources)} manba keldi)")
             out = with_retry(lambda: nlm(p, "create", f"Kazus: {req.title}"[:80], timeout=120))
             m = UUID_RE.search(out)
             if not m:
                 raise NlmError(f"daftar ID topilmadi: {out[:200]}")
             nid, custom = m.group(0), True
-            for src in req.sources[:MAX_SOURCES]:
+            to_add = group_sources(req.sources)[:MAX_SOURCES]
+            step(f"daftar tayyor, {len(to_add)} ta manba qo'shiladi")
+            for i, src in enumerate(to_add, 1):
+                kind, value = source_target(src)
+                step(f"manba {i}/{len(to_add)} qo'shilyapti ({kind}, {len(value)} belgi)")
                 add_source(p, nid, src)
-            wait_sources_ready(p, nid)
+            step("manbalar qo'shildi, indekslanishi kutilyapti")
+            wait_sources_ready(p, nid, max_wait=120 + 15 * len(to_add))
+            step("manbalar tayyor")
+        else:
+            step("manba yo'q, umumiy daftardan javob olinadi")
 
+        step("savol yuborilyapti")
         prompt = build_prompt(req)
         ask = lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420)
         if custom:
@@ -446,10 +491,12 @@ def run_job(job: dict, acc: dict) -> dict:
         else:
             with UMUMIY_LOCKS[p]:   # umumiy chat: bir vaqtda bitta savol
                 raw = with_retry(ask)
+        step("javob keldi")
         return {"answer": clean_answer(raw, custom), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
     finally:
         if custom:
             delete_notebook(p, nid)
+            step("vaqtinchalik daftar o'chirildi")
 
 
 def worker(acc: dict):
@@ -586,8 +633,13 @@ def create_job(req: KazusRequest):
         raise HTTPException(422, f"Manbalar soni {MAX_SOURCES} tadan oshmasin")
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
+        if req.external_id:
+            for jid, j in JOBS.items():
+                if j.get("external_id") == req.external_id and j["status"] in ("queued", "running"):
+                    print(f"[create] dublikat so'rov: external_id={req.external_id} -> mavjud job={jid}")
+                    return {"job_id": jid, "status": j["status"], "queue_size": QUEUE.qsize()}
         JOBS[job_id] = {
-            "req": req, "status": "queued", "created": time.time(), "tried": set(),
+            "id": job_id, "req": req, "status": "queued", "created": time.time(), "tried": set(),
             "external_id": req.external_id,
         }
     QUEUE.put(job_id)

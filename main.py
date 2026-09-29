@@ -54,7 +54,7 @@ ACCOUNTS = json.loads(os.environ["NLM_ACCOUNTS_JSON"]) if os.environ.get("NLM_AC
 
 MIN_GAP_SEC = float(os.environ.get("MIN_GAP_SEC", "3"))      # bir akkauntning ketma-ket CLI chaqiruvlari orasidagi pauza
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))        # vaqtinchalik xatoda qayta urinishlar soni
-MAX_SOURCES = 10
+MAX_SOURCES = 18
 JOB_TTL_SEC = 3600                                           # tugagan ishlar xotirada 1 soat turadi
 AUTH_REFRESH_HOURS = float(os.environ.get("NLM_AUTH_REFRESH_HOURS", "6"))  # 0 = o'chirilgan
 

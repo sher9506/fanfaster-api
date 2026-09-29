@@ -76,6 +76,23 @@ NO_QUESTION_RULE = (
 )
 OFFER_HINTS = ("xohlaysizmi", "istaysizmi", "internet", "qidirib", "batafsilroq", "yordam beraman", "yordam bera olaman")
 BRAND_RE = re.compile(r"(?i)notebook\s?lm|gemini\s+notebook")
+# Ustozga ko'rinmasligi kerak bo'lgan ichki so'zlar (daftar, baza, brend). Shunday so'z bor gap butunlay olib tashlanadi.
+LEAK_RE = re.compile(r"(?i)notebook\s?lm|gemini\s+notebook|daftar|umumiy\s+baza")
+# NotebookLM "manba yo'q, tahlil qila olmayman" degan holatni aniqlash iboralari
+REFUSAL_HINTS = (
+    "hech qanday manba", "manbalar qatorida bo'lmagani", "manbalar orasida yo'q",
+    "imkoni yo'q", "amalga oshirish imkoni", "faqat daftar", "yuklangan manba",
+    "manbalar mavjud emas", "manba yoki hujjat mavjud emas",
+)
+NO_BASIS_MSG_GENERAL = (
+    "Bu kazus bo'yicha tegishli qonun matnlari topilmadi. "
+    "Kazusga mos manba (qonun havolasi yoki matni) qo'shib, qayta urinib ko'ring."
+)
+NO_BASIS_MSG_SOURCES = (
+    "Berilgan manbalarda bu kazusga tegishli norma topilmadi. "
+    "Boshqa manba qo'shing yoki manbasiz qayta urinib ko'ring."
+)
+CLEAN_MARKDOWN = os.environ.get("CLEAN_MARKDOWN", "1") == "1"   # ###, **, --- belgilarini olib tashlash
 URL_ONLY_RE = re.compile(r"^https?://\S+$", re.I)
 MAX_ARG_BYTES = 100_000   # Linux'da bitta buyruq argumenti ~128 KB dan oshmasligi kerak (UTF-8 baytlarda)
 PENDING_STATUSES = {"processing", "pending", "preparing", "indexing", "uploading", "importing"}
@@ -100,6 +117,10 @@ class SourceError(NlmError):
     def __init__(self, user_msg: str, detail: str = ""):
         super().__init__(detail or user_msg)
         self.user_msg = user_msg
+
+
+class NoBasisError(SourceError):
+    """Model "manba yo'q, tahlil qila olmayman" deb rad etdi. Ustozga tayyor neytral matn ko'rsatiladi."""
 
 
 # ───────────────────────── HOLAT ─────────────────────────
@@ -175,15 +196,81 @@ def with_retry(fn):
             delay *= 3
 
 
-def clean_answer(raw: str) -> str:
+def _norm(s: str) -> str:
+    return re.sub(r"[‘’ʻʼ`´]", "'", s).lower()
+
+
+def is_refusal(text: str) -> bool:
+    """Qisqa javobda "manba yo'q / tahlil imkoni yo'q" iborasi bo'lsa va IRAC tuzilmasi bo'lmasa, rad deb hisoblanadi.
+    Uzun yoki tuzilmali javobdagi "manbada yo'q" degan foydali gaplar rad hisoblanmaydi."""
+    n = _norm(text)
+    hit = any(h in n for h in REFUSAL_HINTS)
+    structured = "issue" in n and "conclusion" in n
+    return hit and len(text) < 1500 and not structured
+
+
+def strip_markdown(txt: str) -> str:
+    """###, **, --- belgilarini olib tashlaydi, ro'yxatni tirega aylantiradi, qattiq qator uzilishlarini birlashtiradi."""
+    out_lines = []
+    for ln in txt.splitlines():
+        s = ln.rstrip()
+        if re.match(r"^\s*([-*_])\1{2,}\s*$", s):          # --- yoki ***
+            out_lines.append("")
+            continue
+        h = re.match(r"^\s*#{1,6}\s*(.*)$", s)
+        if h:                                                # sarlavha: alohida abzats
+            out_lines += ["", re.sub(r"\*\*|__", "", h.group(1)).strip(), ""]
+            continue
+        s = re.sub(r"^(\s*)[*•]\s+", r"\1- ", s)              # * bandi -> - bandi
+        s = re.sub(r"\*\*|__", "", s)
+        s = re.sub(r"(?<![*\w])\*(?!\s)([^*\n]+?)\*(?![*\w])", r"\1", s)   # *kursiv*
+        out_lines.append(s)
+    # qattiq qator uzilishlarini birlashtirish (ro'yxat bandi/raqamli band yangi qator boshlaydi)
+    starts_new = re.compile(r"^\s*(\d+[.)]\s|[-•]\s)")
+    merged = []
+    for ln in out_lines:
+        cur = ln.strip()
+        if not cur:
+            if merged and merged[-1] != "":
+                merged.append("")
+            continue
+        if merged and merged[-1] != "" and not starts_new.match(ln):
+            merged[-1] += " " + cur
+        else:
+            merged.append(ln.rstrip() if starts_new.match(ln) else cur)
+    return "\n".join(merged).strip()
+
+
+def strip_leaks(txt: str) -> str:
+    """Ichki so'zlar (daftar, umumiy baza, NotebookLM) uchragan gaplarni olib tashlaydi."""
+    res = []
+    for ln in txt.splitlines():
+        if not LEAK_RE.search(ln):
+            res.append(ln)
+            continue
+        m = re.match(r"^(\s*(?:\d+[.)]|[-•])\s+)?(.*)$", ln)
+        prefix, body = (m.group(1) or ""), m.group(2)
+        kept = [x for x in re.split(r"(?<=[.!?])\s+", body) if x and not LEAK_RE.search(x)]
+        if kept:
+            res.append(prefix + " ".join(kept))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(res)).strip()
+
+
+def clean_answer(raw: str, custom: bool = False) -> str:
     lines = [
         ln for ln in raw.splitlines()
         if not re.match(r"^\s*(Continuing conversation|Resumed conversation|Conversation:)", ln)
     ]
     txt = "\n".join(lines).strip()
     txt = re.sub(r"^Answer:\s*", "", txt).strip()
+    if is_refusal(txt):
+        raise NoBasisError(NO_BASIS_MSG_SOURCES if custom else NO_BASIS_MSG_GENERAL,
+                           f"model rad etdi: {txt[:300]!r}")
+    if CLEAN_MARKDOWN:
+        txt = strip_markdown(txt)
     txt = strip_trailing_offer(txt)
-    return BRAND_RE.sub("manba", txt)
+    txt = strip_leaks(txt)
+    return BRAND_RE.sub("", txt)
 
 
 def strip_trailing_offer(txt: str) -> str:
@@ -323,7 +410,7 @@ def run_job(job: dict, acc: dict) -> dict:
         else:
             with UMUMIY_LOCKS[p]:   # umumiy chat: bir vaqtda bitta savol
                 raw = with_retry(ask)
-        return {"answer": clean_answer(raw), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
+        return {"answer": clean_answer(raw, custom), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
     finally:
         if custom:
             delete_notebook(p, nid)
@@ -468,6 +555,9 @@ def create_job(req: KazusRequest):
             "external_id": req.external_id,
         }
     QUEUE.put(job_id)
+    # diagnostika: Bolt manbalarni yuboryaptimi? (Render Logs'da ko'rinadi, matn chiqarilmaydi)
+    kinds = [("url" if (x.url or URL_ONLY_RE.match((x.content or "").strip())) else f"text:{len(x.content or '')}") for x in req.sources]
+    print(f"[create] job={job_id} sources={len(req.sources)} {kinds}")
     return {"job_id": job_id, "status": "queued", "queue_size": QUEUE.qsize()}
 
 

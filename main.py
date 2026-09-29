@@ -74,6 +74,10 @@ NO_QUESTION_RULE = (
     "\n\nMUHIM QOIDA: Javobni xulosa bilan tugating. Javob oxirida foydalanuvchiga hech qanday savol bermang, "
     "internetdan qidirishni yoki qo'shimcha yordam/ma'lumot taklif qilishni yozmang."
 )
+LATIN_RULE = (
+    "\nJavobni to'liq o'zbek LOTIN yozuvida yozing. Manba kirill yozuvida bo'lsa ham, undagi iboralarni lotin alifbosiga o'tkazib yozing; "
+    "javobda kirill harflari bo'lmasin."
+)
 OFFER_HINTS = ("xohlaysizmi", "istaysizmi", "internet", "qidirib", "batafsilroq", "yordam beraman", "yordam bera olaman")
 BRAND_RE = re.compile(r"(?i)notebook\s?lm|gemini\s+notebook")
 # Ustozga ko'rinmasligi kerak bo'lgan ichki so'zlar (daftar, baza, brend). Shunday so'z bor gap butunlay olib tashlanadi.
@@ -225,8 +229,9 @@ def strip_markdown(txt: str) -> str:
         s = re.sub(r"\*\*|__", "", s)
         s = re.sub(r"(?<![*\w])\*(?!\s)([^*\n]+?)\*(?![*\w])", r"\1", s)   # *kursiv*
         out_lines.append(s)
-    # qattiq qator uzilishlarini birlashtirish (ro'yxat bandi/raqamli band yangi qator boshlaydi)
+    # qattiq qator uzilishlarini birlashtirish (ro'yxat bandi/raqamli band/sarlavha yangi qator boshlaydi)
     starts_new = re.compile(r"^\s*(\d+[.)]\s|[-•]\s)")
+    head_kw = re.compile(r"(?i)^\s*(?:\d+[.)]\s*|[IVX]+[.)]\s*)?(issue|rule|application|conclusion)\b")
     merged = []
     for ln in out_lines:
         cur = ln.strip()
@@ -234,11 +239,23 @@ def strip_markdown(txt: str) -> str:
             if merged and merged[-1] != "":
                 merged.append("")
             continue
+        prev_blank = (not merged) or merged[-1] == ""
+        is_head = (head_kw.match(cur) and len(cur) <= 100) or \
+                  (prev_blank and len(cur) <= 65 and not re.search(r"[.!?:;,]$", cur) and not starts_new.match(ln))
+        if is_head:                                          # sarlavha: alohida abzats
+            if merged and merged[-1] != "":
+                merged.append("")
+            merged += [cur, ""]
+            continue
         if merged and merged[-1] != "" and not starts_new.match(ln):
             merged[-1] += " " + cur
         else:
             merged.append(ln.rstrip() if starts_new.match(ln) else cur)
-    return "\n".join(merged).strip()
+    res = []
+    for ln in merged:                                        # ko'p qatorga cho'zilgan *kursiv* ham endi bir qatorda
+        ln = re.sub(r"(?<![*\w])\*(?!\s)([^*\n]+?)\*(?![*\w])", r"\1", ln)
+        res.append(ln)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(res)).strip()
 
 
 def strip_leaks(txt: str) -> str:
@@ -266,6 +283,7 @@ def clean_answer(raw: str, custom: bool = False) -> str:
     if is_refusal(txt):
         raise NoBasisError(NO_BASIS_MSG_SOURCES if custom else NO_BASIS_MSG_GENERAL,
                            f"model rad etdi: {txt[:300]!r}")
+    txt = re.sub(r"(?<=\w)[ʻʼ‘’`´](?=\w)", "'", txt)       # oʻ, gʻ va o', g' bir xil ko'rinsin
     if CLEAN_MARKDOWN:
         txt = strip_markdown(txt)
     txt = strip_trailing_offer(txt)
@@ -310,7 +328,7 @@ def build_prompt(req: "KazusRequest") -> str:
     tpl = req.instruction or DEFAULT_PROMPT
     if "{kazus}" not in tpl:
         tpl = tpl + "\n\nKAZUS MATNI:\n{kazus}"
-    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE
+    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE + LATIN_RULE
 
 
 def source_target(src: "Source"):
@@ -321,6 +339,11 @@ def source_target(src: "Source"):
     if URL_ONLY_RE.match(c):     # eski format: content ichida faqat havola
         return "url", c
     return "text", c
+
+
+def is_source_failure(msg: str) -> bool:
+    low = msg.lower()
+    return any(k in low for k in ("failed to add source", "add_source failed", "rpc_code=9", "could not be confirmed"))
 
 
 def add_source(p: str, nid: str, src: "Source") -> None:
@@ -348,7 +371,10 @@ def add_source(p: str, nid: str, src: "Source") -> None:
                     os.remove(path)
                 except OSError:
                     pass
-    except AuthError:
+    except AuthError as e:
+        # "Failed to add source" / rpc_code=9 -- bu manbaning o'zi ochilmagani, akkaunt auth xatosi emas
+        if is_source_failure(str(e)):
+            raise SourceError(SOURCE_FAIL_MSG, f"source add ({kind}, «{title}»): {e}")
         raise
     except SourceError:
         raise

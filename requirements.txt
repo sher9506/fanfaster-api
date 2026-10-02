@@ -1,3 +1,4 @@
 fastapi
 uvicorn
-notebooklm-py[headless,impersonate]
+pydantic>=2
+notebooklm-py[android]==0.8.3

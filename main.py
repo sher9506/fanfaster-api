@@ -58,6 +58,13 @@ MAX_SOURCES = 18
 JOB_TTL_SEC = 3600                                           # tugagan ishlar xotirada 1 soat turadi
 AUTH_REFRESH_HOURS = float(os.environ.get("NLM_AUTH_REFRESH_HOURS", "6"))  # 0 = o'chirilgan
 
+# Umumiy (50 manbali) daftardagi `ask` web backend'da 400-540 MB RAM yeydi (Render'da 512 MB). Android backend ~145 MB.
+# NLM_ASK_BACKEND=android  -> faqat umumiy daftar savoli android orqali (boshqa buyruqlar va vaqtinchalik daftarlar o'zgarmaydi).
+# Android xato bersa web'ga QAYTILMAYDI (web 512 MB'dan oshib, butun serverni o'chiradi).
+ASK_BACKEND = os.environ.get("NLM_ASK_BACKEND", "").strip().lower()      # "" = web (eski xulq)
+HEAVY_ASK_LIMIT = max(int(os.environ.get("HEAVY_ASK_LIMIT", "1")), 1)    # bir vaqtda nechta umumiy-daftar savoli (butun server bo'yicha)
+HEAVY_ASK_SEM = threading.BoundedSemaphore(HEAVY_ASK_LIMIT)
+
 NLM = shutil.which("notebooklm") or "notebooklm"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 UMUMIY_IDS = {a["umumiy"] for a in ACCOUNTS}
@@ -169,7 +176,8 @@ def ensure_session(profile: str, force: bool = False) -> bool:
         return os.path.exists(path)
 
 
-def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = None, _retried: bool = False) -> str:
+def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = None,
+        backend: Optional[str] = None, _retried: bool = False) -> str:
     """notebooklm CLI'ni bitta akkaunt (profil) nomidan chaqiradi. Chaqiruvlar orasida pauza qo'yadi."""
     with GAP_LOCKS[profile]:
         wait = MIN_GAP_SEC - (time.time() - LAST_CALL[profile])
@@ -177,14 +185,15 @@ def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = Non
             time.sleep(wait)
         LAST_CALL[profile] = time.time()
     try:
-        r = subprocess.run([NLM, "-p", profile, *args], capture_output=True, text=True, timeout=timeout, input=stdin)
+        cmd = [NLM, "-p", profile] + (["--backend", backend] if backend else []) + list(args)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=stdin)
     except subprocess.TimeoutExpired:
         raise NlmError("timeout: NotebookLM javob bermadi")
     if r.returncode != 0:
         msg = (r.stderr or r.stdout or "noma'lum xato").strip()[:500]
         low = msg.lower()
         if "not logged in" in low and not _retried and ensure_session(profile, force=True):
-            return nlm(profile, *args, timeout=timeout, stdin=stdin, _retried=True)
+            return nlm(profile, *args, timeout=timeout, stdin=stdin, backend=backend, _retried=True)
         if any(w in low for w in AUTH_WORDS):
             raise AuthError(msg)
         raise NlmError(msg)
@@ -483,14 +492,18 @@ def run_job(job: dict, acc: dict) -> dict:
         else:
             step("manba yo'q, umumiy daftardan javob olinadi")
 
-        step("savol yuborilyapti")
         prompt = build_prompt(req)
-        ask = lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420)
         if custom:
-            raw = with_retry(ask)
+            step("savol yuborilyapti (vaqtinchalik daftar)")
+            raw = with_retry(lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420))
         else:
-            with UMUMIY_LOCKS[p]:   # umumiy chat: bir vaqtda bitta savol
-                raw = with_retry(ask)
+            ask = lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420, backend=ASK_BACKEND or None)
+            # tartib muhim: avval akkaunt qulfi, keyin umumiy semafor (boshqa akkaunt ishi bekorga bloklanmasin)
+            with UMUMIY_LOCKS[p]:   # umumiy chat: bir akkauntda bir vaqtda bitta savol
+                step(f"savol navbatda (umumiy daftar, backend={ASK_BACKEND or 'web'})")
+                with HEAVY_ASK_SEM:  # RAM himoyasi: server bo'yicha bir vaqtda HEAVY_ASK_LIMIT ta
+                    step("savol yuborilyapti")
+                    raw = with_retry(ask)
         step("javob keldi")
         return {"answer": clean_answer(raw, custom), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
     finally:
@@ -668,7 +681,10 @@ def get_job(job_id: str):
 
 @app.get("/api/stats", dependencies=[Depends(require_key)])
 def stats():
-    return {"queue_size": QUEUE.qsize(), "accounts": STATS}
+    master = {a["profile"]: os.path.exists(os.path.expanduser(f"~/.notebooklm/profiles/{a['profile']}/master_token.json"))
+              for a in ACCOUNTS}
+    return {"queue_size": QUEUE.qsize(), "ask_backend": ASK_BACKEND or "web", "heavy_ask_limit": HEAVY_ASK_LIMIT,
+            "master_token_present": master, "accounts": STATS}
 
 
 @app.get("/")

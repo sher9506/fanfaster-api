@@ -418,18 +418,47 @@ def mem_mb() -> str:
     return "?"
 
 
+def top_procs(n: int = 3) -> str:
+    """Eng ko'p xotira yeyotgan jarayonlar (nomi:MB) -- /proc orqali, qo'shimcha kutubxonasiz."""
+    rows = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                name, rss = "?", 0
+                with open(f"/proc/{pid}/status") as f:
+                    for line in f:
+                        if line.startswith("Name:"):
+                            name = line.split()[1]
+                        elif line.startswith("VmRSS:"):
+                            rss = int(line.split()[1]) // 1024
+                rows.append((rss, name))
+            except OSError:
+                continue
+    except OSError:
+        return "?"
+    rows.sort(reverse=True)
+    return ",".join(f"{nm}:{r}" for r, nm in rows[:n])
+
+
 class MemWatch:
-    """Savol ketayotgan paytda har 6 soniyada xotirani logga yozadi (qaysi vaqtda to'lib ketishini ko'rish uchun)."""
+    """Savol paytida xotirani har 1 soniyada o'lchaydi. Sakrash (>=20 MB) bo'lsa yoki har 6 soniyada logga yozadi
+    (qaysi jarayon va qaysi lahzada o'sganini ko'rish uchun)."""
     def __init__(self, label: str):
         self.label, self.stop, self.t = label, threading.Event(), None
         self.peak = 0
 
     def _run(self):
-        while not self.stop.wait(6):
+        last_logged, last_t = 0, 0.0
+        while not self.stop.wait(1):
             m = mem_mb()
-            if m.isdigit():
-                self.peak = max(self.peak, int(m))
-            print(f"[mem] {self.label} used={m}MB peak={self.peak}MB", flush=True)
+            cur = int(m) if m.isdigit() else 0
+            self.peak = max(self.peak, cur)
+            now = time.time()
+            if cur - last_logged >= 20 or now - last_t >= 6:
+                print(f"[mem] {self.label} used={m}MB peak={self.peak}MB top={top_procs()}", flush=True)
+                last_logged, last_t = cur, now
 
     def __enter__(self):
         self.t = threading.Thread(target=self._run, daemon=True)
@@ -438,6 +467,7 @@ class MemWatch:
 
     def __exit__(self, *a):
         self.stop.set()
+        print(f"[mem] {self.label} tugadi, peak={self.peak}MB", flush=True)
 
 
 def source_target(src: "Source"):

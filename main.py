@@ -65,6 +65,9 @@ ASK_BACKEND = os.environ.get("NLM_ASK_BACKEND", "").strip().lower()      # "" = 
 # NLM_CUSTOM_ASK_BACKEND=android  -> vaqtinchalik (manbali) daftarga savol ham android orqali (katta kodekslar web'da RAMni to'ldiradi).
 # Bo'sh = avvalgidek (web). Web bo'lsa, savol HEAVY_ASK_SEM bilan serverga bir vaqtda HEAVY_ASK_LIMIT ta bilan cheklanadi.
 CUSTOM_ASK_BACKEND = os.environ.get("NLM_CUSTOM_ASK_BACKEND", "").strip().lower()
+# NLM_BATCH_URLS=1 (standart) -> bir nechta havola bitta `source add-async` chaqiruvida qo'shiladi (tezroq, kam jarayon).
+# Xato bo'lsa, avtomatik birma-bir qo'shishga qaytadi. 0 = doim birma-bir.
+BATCH_URLS = os.environ.get("NLM_BATCH_URLS", "1").strip() != "0"
 HEAVY_ASK_LIMIT = max(int(os.environ.get("HEAVY_ASK_LIMIT", "1")), 1)    # bir vaqtda nechta umumiy-daftar savoli (butun server bo'yicha)
 HEAVY_ASK_SEM = threading.BoundedSemaphore(HEAVY_ASK_LIMIT)
 
@@ -456,6 +459,11 @@ def add_source(p: str, nid: str, src: "Source") -> None:
         raise SourceError(fail_msg, f"source add ({kind}, «{title}»): {e}")
 
 
+def add_urls_batch(p: str, nid: str, urls: List[str]) -> None:
+    """Barcha havolalarni bitta so'rovda navbatga qo'yadi (ingest tugashini wait_sources_ready kutadi)."""
+    nlm(p, "source", "add-async", "--notebook", nid, "--", *urls, timeout=300)
+
+
 def source_statuses(p: str, nid: str) -> List[str]:
     """`source list` jadvalidan har bir manbaning holatini (oxirgi ustun) o'qiydi."""
     out = nlm(p, "source", "list", "--notebook", nid, timeout=60)
@@ -538,9 +546,21 @@ def run_job(job: dict, acc: dict) -> dict:
             nid, custom = m.group(0), True
             to_add = group_sources(req.sources)[:MAX_SOURCES]
             step(f"daftar tayyor, {len(to_add)} ta manba qo'shiladi")
-            for i, src in enumerate(to_add, 1):
+            url_srcs = [x for x in to_add if source_target(x)[0] == "url"]
+            batched = False
+            if BATCH_URLS and len(url_srcs) >= 2:
+                try:
+                    step(f"{len(url_srcs)} ta havola bitta so'rovda qo'shilyapti")
+                    add_urls_batch(p, nid, [source_target(x)[1] for x in url_srcs])
+                    batched = True
+                except AuthError:
+                    raise
+                except NlmError as e:
+                    step(f"ommaviy qo'shish xato berdi, birma-bir qo'shishga o'tildi: {str(e)[:120]}")
+            queue = [x for x in to_add if source_target(x)[0] != "url"] if batched else to_add
+            for i, src in enumerate(queue, 1):
                 kind, value = source_target(src)
-                step(f"manba {i}/{len(to_add)} qo'shilyapti ({kind}, {len(value)} belgi)")
+                step(f"manba {i}/{len(queue)} qo'shilyapti ({kind}, {len(value)} belgi)")
                 add_source(p, nid, src)
             step("manbalar qo'shildi, indekslanishi kutilyapti")
             wait_sources_ready(p, nid, max_wait=120 + 15 * len(to_add))
@@ -757,7 +777,7 @@ def get_job(job_id: str):
 def stats():
     master = {a["profile"]: os.path.exists(os.path.expanduser(f"~/.notebooklm/profiles/{a['profile']}/master_token.json"))
               for a in ACCOUNTS}
-    return {"raw_mode": RAW_MODE, "queue_size": QUEUE.qsize(), "ask_backend": ASK_BACKEND or "web", "custom_ask_backend": CUSTOM_ASK_BACKEND or "web", "heavy_ask_limit": HEAVY_ASK_LIMIT,
+    return {"raw_mode": RAW_MODE, "queue_size": QUEUE.qsize(), "ask_backend": ASK_BACKEND or "web", "custom_ask_backend": CUSTOM_ASK_BACKEND or "web", "batch_urls": BATCH_URLS, "heavy_ask_limit": HEAVY_ASK_LIMIT,
             "master_token_present": master, "accounts": STATS}
 
 

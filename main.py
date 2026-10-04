@@ -407,6 +407,39 @@ def build_prompt(req: "KazusRequest") -> str:
     return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE + LATIN_RULE + ACCURACY_RULE + PRIVACY_RULE
 
 
+def mem_mb() -> str:
+    """Konteyner xotirasi (MB) -- Render shu qiymat bo'yicha serverni o'chiradi. O'qib bo'lmasa '?'."""
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path) as f:
+                return str(int(f.read().strip()) // (1024 * 1024))
+        except (OSError, ValueError):
+            continue
+    return "?"
+
+
+class MemWatch:
+    """Savol ketayotgan paytda har 6 soniyada xotirani logga yozadi (qaysi vaqtda to'lib ketishini ko'rish uchun)."""
+    def __init__(self, label: str):
+        self.label, self.stop, self.t = label, threading.Event(), None
+        self.peak = 0
+
+    def _run(self):
+        while not self.stop.wait(6):
+            m = mem_mb()
+            if m.isdigit():
+                self.peak = max(self.peak, int(m))
+            print(f"[mem] {self.label} used={m}MB peak={self.peak}MB", flush=True)
+
+    def __enter__(self):
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+        return self
+
+    def __exit__(self, *a):
+        self.stop.set()
+
+
 def source_target(src: "Source"):
     """Manba turini aniqlaydi: ("url", havola) yoki ("text", matn)."""
     if src.url:
@@ -534,7 +567,7 @@ def run_job(job: dict, acc: dict) -> dict:
     t0 = time.time()
 
     def step(msg: str):
-        print(f"[step] job={jid} {p} +{time.time() - t0:.0f}s {msg}", flush=True)
+        print(f"[step] job={jid} {p} +{time.time() - t0:.0f}s mem={mem_mb()}MB {msg}", flush=True)
 
     try:
         if req.sources:
@@ -572,10 +605,9 @@ def run_job(job: dict, acc: dict) -> dict:
         if custom:
             step("savol yuborilyapti (vaqtinchalik daftar)")
             ask_c = lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420, backend=CUSTOM_ASK_BACKEND or None)
-            if CUSTOM_ASK_BACKEND == "android":
-                raw = with_retry(ask_c)
-            else:
-                with HEAVY_ASK_SEM:   # web backend og'ir: RAM himoyasi uchun bir vaqtda cheklangan
+            with HEAVY_ASK_SEM:   # RAM himoyasi: server bo'yicha bir vaqtda HEAVY_ASK_LIMIT ta savol (android bo'lsa ham)
+                step("savol navbatdan o'tdi")
+                with MemWatch(f"job={jid}"):
                     raw = with_retry(ask_c)
         else:
             ask_args = ["ask", "--notebook", nid] + (["--new", "--yes"] if RAW_MODE else []) + [prompt]

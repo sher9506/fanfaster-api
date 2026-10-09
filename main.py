@@ -384,6 +384,35 @@ def strip_trailing_offer(txt: str) -> str:
     return txt
 
 
+OVERSIZE_WORDS = ("rpc response exceeded", "exceeded 268435456")
+
+
+def is_oversize_error(msg: str) -> bool:
+    """NotebookLM javobi 256 MB cheklovidan oshdi (katta manbalar, web backend). Qayta urinish foydasiz, backend almashtirish kerak."""
+    low = msg.lower()
+    return any(w in low for w in OVERSIZE_WORDS)
+
+
+def ask_custom(p: str, nid: str, prompt: str, step) -> str:
+    """Vaqtinchalik (manbali) daftarga savol. Javob hajmi oshib ketsa, bir marta android backend bilan qayta urinadi."""
+    backends = [CUSTOM_ASK_BACKEND or None]
+    if CUSTOM_ASK_BACKEND != "android":
+        backends.append("android")
+    last: Optional[Exception] = None
+    for be in backends:
+        try:
+            return with_retry(lambda: nlm(p, "ask", "--notebook", nid, prompt,
+                                          timeout=420, backend=be))
+        except AuthError:
+            raise
+        except NlmError as e:
+            last = e
+            if not is_oversize_error(str(e)):
+                raise
+            step(f"javob hajmi oshib ketdi (backend={be or 'web'}), keyingisi sinaladi")
+    raise SourceError("Manbalar juda katta, javob tayyorlanmadi. Qisqaroq manba tanlang.", f"oversize: {last}")
+
+
 def delete_notebook(profile: str, nid: str) -> bool:
     """Faqat vaqtinchalik daftarni o'chiradi. Umumiy daftarlarga hech qachon tegmaydi."""
     if not nid or nid in UMUMIY_IDS:
@@ -634,11 +663,10 @@ def run_job(job: dict, acc: dict) -> dict:
         prompt = build_prompt(req)
         if custom:
             step("savol yuborilyapti (vaqtinchalik daftar)")
-            ask_c = lambda: nlm(p, "ask", "--notebook", nid, prompt, timeout=420, backend=CUSTOM_ASK_BACKEND or None)
             with HEAVY_ASK_SEM:   # RAM himoyasi: server bo'yicha bir vaqtda HEAVY_ASK_LIMIT ta savol (android bo'lsa ham)
                 step("savol navbatdan o'tdi")
                 with MemWatch(f"job={jid}"):
-                    raw = with_retry(ask_c)
+                    raw = ask_custom(p, nid, prompt, step)
         else:
             ask_args = ["ask", "--notebook", nid] + (["--new", "--yes"] if RAW_MODE else []) + [prompt]
             ask = lambda: nlm(p, *ask_args, timeout=420, backend=ASK_BACKEND or None)

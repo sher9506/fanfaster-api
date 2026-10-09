@@ -626,7 +626,7 @@ def run_job(job: dict, acc: dict) -> dict:
                 step(f"manba {i}/{len(queue)} qo'shilyapti ({kind}, {len(value)} belgi)")
                 add_source(p, nid, src)
             step("manbalar qo'shildi, indekslanishi kutilyapti")
-            wait_sources_ready(p, nid, max_wait=120 + 15 * len(to_add))
+            wait_sources_ready(p, nid, max_wait=300 + 30 * len(to_add))   # 5 manba: 450s (avval 195s)
             step("manbalar tayyor")
         else:
             step("manba yo'q, umumiy daftardan javob olinadi")

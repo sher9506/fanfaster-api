@@ -68,6 +68,13 @@ CUSTOM_ASK_BACKEND = os.environ.get("NLM_CUSTOM_ASK_BACKEND", "").strip().lower(
 # NLM_BATCH_URLS=1 (standart) -> bir nechta havola bitta `source add-async` chaqiruvida qo'shiladi (tezroq, kam jarayon).
 # Xato bo'lsa, avtomatik birma-bir qo'shishga qaytadi. 0 = doim birma-bir.
 BATCH_URLS = os.environ.get("NLM_BATCH_URLS", "1").strip() != "0"
+# NLM_MAX_URLS=4 -> vaqtinchalik daftarga eng ko'pi bilan shuncha havola qo'shiladi (0 = cheklovsiz). Javob 256 MB dan oshib ketsa kamaytiriladi.
+MAX_URLS = max(int(os.environ.get("NLM_MAX_URLS", "0")), 0)
+# NLM_CHAT_MAX_MB=1024 -> notebooklm-py'ning chat javobi limiti (standart 256 MB). Katta manbalarda oqim 256 MB dan oshib ketadi;
+# javob oqimli o'qiladi (RAMda yig'ilmaydi), shuning uchun limitni oshirish xotirani to'ldirmaydi. 0 = tegmaslik.
+CHAT_MAX_MB = max(int(os.environ.get("NLM_CHAT_MAX_MB", "0")), 0)
+# NLM_ASK_TIMEOUT=600 -> `ask` buyrug'i uchun umumiy kutish (soniya). Katta oqim uchun oshiring.
+ASK_TIMEOUT = max(int(os.environ.get("NLM_ASK_TIMEOUT", "420")), 60)
 HEAVY_ASK_LIMIT = max(int(os.environ.get("HEAVY_ASK_LIMIT", "1")), 1)    # bir vaqtda nechta umumiy-daftar savoli (butun server bo'yicha)
 HEAVY_ASK_SEM = threading.BoundedSemaphore(HEAVY_ASK_LIMIT)
 
@@ -207,6 +214,33 @@ STATS = {
 
 
 # ───────────────────────── CLI YORDAMCHILARI ─────────────────────────
+def patch_chat_limit() -> None:
+    """notebooklm-py'dagi DEFAULT_CHAT_RESPONSE_MAX_BYTES ni NLM_CHAT_MAX_MB ga o'zgartiradi (CLI har chaqiruvda yangidan import qiladi)."""
+    if not CHAT_MAX_MB:
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("notebooklm")
+        if not spec or not spec.submodule_search_locations:
+            print("[patch] notebooklm paketi topilmadi, limit o'zgartirilmadi", flush=True)
+            return
+        path = os.path.join(list(spec.submodule_search_locations)[0], "_runtime", "config.py")
+        src = open(path, encoding="utf-8").read()
+        new_line = f"DEFAULT_CHAT_RESPONSE_MAX_BYTES = {CHAT_MAX_MB} * 1024 * 1024"
+        pat = re.compile(r"^DEFAULT_CHAT_RESPONSE_MAX_BYTES\s*=.*$", re.M)
+        if not pat.search(src):
+            print("[patch] DEFAULT_CHAT_RESPONSE_MAX_BYTES topilmadi (kutubxona versiyasi boshqa)", flush=True)
+            return
+        if new_line in src:
+            print(f"[patch] chat limiti allaqachon {CHAT_MAX_MB} MB", flush=True)
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(pat.sub(new_line, src, count=1))
+        print(f"[patch] chat javob limiti {CHAT_MAX_MB} MB ga o'zgartirildi", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[patch] limitni o'zgartirib bo'lmadi: {e}", flush=True)
+
+
 def ensure_session(profile: str, force: bool = False) -> bool:
     """storage_state.json yo'q (yoki majburan) bo'lsa, master token'dan cookie'ni qayta yasaydi."""
     path = os.path.expanduser(f"~/.notebooklm/profiles/{profile}/storage_state.json")
@@ -402,7 +436,7 @@ def ask_custom(p: str, nid: str, prompt: str, step) -> str:
     for be in backends:
         try:
             return with_retry(lambda: nlm(p, "ask", "--notebook", nid, prompt,
-                                          timeout=420, backend=be))
+                                          timeout=ASK_TIMEOUT, backend=be))
         except AuthError:
             raise
         except NlmError as e:
@@ -637,6 +671,19 @@ def run_job(job: dict, acc: dict) -> dict:
                 raise NlmError(f"daftar ID topilmadi: {out[:200]}")
             nid, custom = m.group(0), True
             to_add = group_sources(req.sources)[:MAX_SOURCES]
+            if MAX_URLS:
+                kept, n_url = [], 0
+                for x in to_add:
+                    if source_target(x)[0] == "url":
+                        n_url += 1
+                        if n_url > MAX_URLS:
+                            continue
+                    kept.append(x)
+                if len(kept) < len(to_add):
+                    step(f"havolalar {MAX_URLS} tagacha qisqartirildi ({len(to_add)} -> {len(kept)})")
+                to_add = kept
+            ids = [source_target(x)[1].rsplit("/", 1)[-1] for x in to_add if source_target(x)[0] == "url"]
+            step(f"havola ID'lari: {ids}")
             step(f"daftar tayyor, {len(to_add)} ta manba qo'shiladi")
             url_srcs = [x for x in to_add if source_target(x)[0] == "url"]
             batched = False
@@ -800,6 +847,7 @@ def require_key(x_api_key: str = Header(default="")):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    patch_chat_limit()
     restore_cookies()
     for acc in ACCOUNTS:
         await asyncio.to_thread(ensure_session, acc["profile"])

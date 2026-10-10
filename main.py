@@ -75,6 +75,13 @@ MAX_URLS = max(int(os.environ.get("NLM_MAX_URLS", "0")), 0)
 CHAT_MAX_MB = max(int(os.environ.get("NLM_CHAT_MAX_MB", "0")), 0)
 # NLM_ASK_TIMEOUT=600 -> `ask` buyrug'i uchun umumiy kutish (soniya). Katta oqim uchun oshiring.
 ASK_TIMEOUT = max(int(os.environ.get("NLM_ASK_TIMEOUT", "420")), 60)
+# `ask` "javob tugadi" signalini olmay timeout/DEADLINE_EXCEEDED bilan tugasa, javob NotebookLM suhbat tarixida tayyor turgan bo'ladi.
+# Daftarni o'chirishdan oldin shu tarixdan olamiz (savolni qayta yubormasdan). 0 = o'chirilgan.
+HISTORY_RECOVERY = os.environ.get("NLM_HISTORY_RECOVERY", "1").strip() != "0"
+HISTORY_POLL_SEC = max(int(os.environ.get("NLM_HISTORY_POLL_SEC", "30")), 5)     # tarixni qayta tekshirish oralig'i
+HISTORY_MAX_WAIT = max(int(os.environ.get("NLM_HISTORY_MAX_WAIT", "600")), 30)   # tarixda javob kutishning eng ko'pi (soniya)
+MAX_CONTINUATIONS = max(int(os.environ.get("NLM_MAX_CONTINUATIONS", "2")), 0)    # qirqilgan javobni "davom ettiring" bilan ulash soni
+HISTORY_BACKEND = os.environ.get("NLM_HISTORY_BACKEND", "").strip().lower() or None
 HEAVY_ASK_LIMIT = max(int(os.environ.get("HEAVY_ASK_LIMIT", "1")), 1)    # bir vaqtda nechta umumiy-daftar savoli (butun server bo'yicha)
 HEAVY_ASK_SEM = threading.BoundedSemaphore(HEAVY_ASK_LIMIT)
 
@@ -186,6 +193,10 @@ class AuthError(NlmError):
     pass
 
 
+class AskStalled(NlmError):
+    """`ask` timeout/DEADLINE_EXCEEDED bilan tugadi: savol yuborilgan, javob NotebookLM tarixida bo'lishi mumkin."""
+
+
 class SourceError(NlmError):
     """Manba bilan bog'liq xato. `user_msg` ustozga ko'rsatilishi mumkin (brendsiz, neytral)."""
 
@@ -291,7 +302,7 @@ def with_retry(fn, retries: Optional[int] = None):
     for attempt in range(n + 1):
         try:
             return fn()
-        except AuthError:
+        except (AuthError, AskStalled):
             raise
         except NlmError as e:
             transient = any(w in str(e).lower() for w in TRANSIENT_WORDS)
@@ -427,17 +438,65 @@ def is_oversize_error(msg: str) -> bool:
     return any(w in low for w in OVERSIZE_WORDS)
 
 
+STALL_WORDS = ("deadline_exceeded", "deadline exceeded", "timeout", "timed out")
+TERMINAL_CHARS = ".!?…»”\"')*"
+CITATION_TAIL_RE = re.compile(r"(?:\s*\[\d+(?:[\s,\-–]+\d+)*\])+\s*$")
+CONCLUSION_WORDS = ("xulosa", "conclusion")
+CONTINUE_DONE = "TUGADI"
+CONTINUE_PROMPT = (
+    "Oldingi javobingiz oxirigacha yetmay uzilib qoldi. Aynan uzilgan joyidan davom ettiring: "
+    "yozilganlarni takrorlamang, boshidan boshlamang, sarlavhalarni qaytarmang. "
+    "So'nggi gapdan keyin to'g'ridan-to'g'ri davom eting va xulosa bilan tugating. "
+    f"Agar javob aslida to'liq bo'lsa, faqat «{CONTINUE_DONE}» deb yozing.\n\n"
+    "Oxirgi yozilgan qism:\n{tail}"
+)
+
+
+def is_stall_error(msg: str) -> bool:
+    """`ask` javob oqimi tugamay vaqt tugagan holat (429/kvota va hajm xatolari bunga kirmaydi)."""
+    low = msg.lower()
+    return any(w in low for w in STALL_WORDS)
+
+
+def looks_truncated(text: str) -> bool:
+    """Javob o'rtasida uzilganmi: jumla bilan tugamagan, yoki uzun javobda xulosa yo'q."""
+    t = (text or "").rstrip()
+    if not t:
+        return True
+    if RAW_MODE:
+        return not t.endswith("]")
+    t = CITATION_TAIL_RE.sub("", t).rstrip()
+    if not t or t[-1] not in TERMINAL_CHARS:
+        return True
+    return len(t) > 1500 and not any(w in _norm(t) for w in CONCLUSION_WORDS)
+
+
+def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Optional[str] = None) -> str:
+    """Bitta `ask` chaqiruvi. Timeout/DEADLINE_EXCEEDED bo'lsa AskStalled ko'taradi (with_retry savolni qayta yubormaydi)."""
+    args = ["ask", "--notebook", nid] + (["-c", conv_id] if conv_id else []) + [prompt]
+    try:
+        return nlm(p, *args, timeout=ASK_TIMEOUT, backend=backend)
+    except AuthError:
+        raise
+    except NlmError as e:
+        if is_stall_error(str(e)) and not is_oversize_error(str(e)):
+            raise AskStalled(str(e)) from e
+        raise
+
+
 def ask_custom(p: str, nid: str, prompt: str, step) -> str:
-    """Vaqtinchalik (manbali) daftarga savol. Javob hajmi oshib ketsa, bir marta android backend bilan qayta urinadi."""
+    """Vaqtinchalik (manbali) daftarga savol. Javob hajmi oshib ketsa, bir marta android backend bilan qayta urinadi.
+    Timeout bo'lsa AskStalled ko'tariladi: chaqiruvchi uni HEAVY_ASK_SEM TASHQARISIDA recover_answer bilan hal qiladi."""
     backends = [CUSTOM_ASK_BACKEND or None]
     if CUSTOM_ASK_BACKEND != "android":
         backends.append("android")
     last: Optional[Exception] = None
     for be in backends:
         try:
-            return with_retry(lambda: nlm(p, "ask", "--notebook", nid, prompt,
-                                          timeout=ASK_TIMEOUT, backend=be))
+            return with_retry(lambda: _ask_cmd(p, nid, prompt, be))
         except AuthError:
+            raise
+        except AskStalled:
             raise
         except NlmError as e:
             last = e
@@ -445,6 +504,85 @@ def ask_custom(p: str, nid: str, prompt: str, step) -> str:
                 raise
             step(f"javob hajmi oshib ketdi (backend={be or 'web'}), keyingisi sinaladi")
     raise SourceError("Manbalar juda katta, javob tayyorlanmadi. Qisqaroq manba tanlang.", f"oversize: {last}")
+
+
+def read_history(p: str, nid: str):
+    """Daftarning oxirgi suhbatini o'qiydi: (conversation_id, [javoblar eskisidan yangisiga]).
+    `ask`dan alohida kichik jarayon; umumiy navbat qulfi ichida chaqirilmaydi."""
+    out = nlm(p, "history", "--notebook", nid, "--json", "--limit", "10", timeout=90, backend=HISTORY_BACKEND)
+    i = out.find("{")
+    if i < 0:
+        raise NlmError(f"history JSON qaytarmadi: {out[:150]!r}")
+    try:
+        data = json.loads(out[i:])
+    except ValueError as e:
+        raise NlmError(f"history JSON o'qilmadi: {e}")
+    answers = [(x.get("answer") or "").strip() for x in data.get("qa_pairs", [])]
+    return data.get("conversation_id"), [a for a in answers if a]
+
+
+def wait_history(p: str, nid: str, turns: int, step):
+    """Suhbatda kamida `turns` ta javob paydo bo'lib, oxirgisi tugagunicha kutadi (har HISTORY_POLL_SEC da, eng ko'pi HISTORY_MAX_WAIT).
+    Oxirgi javob to'liq ko'rinsa darhol qaytadi; qirqilgan bo'lsa, ikki tekshiruvda bir xil qolsa (yozish to'xtagan) qaytadi.
+    Qaytaradi: (conv_id, javoblar). Hech narsa bo'lmasa NlmError."""
+    deadline = time.time() + HISTORY_MAX_WAIT
+    prev_last, conv_id, answers = None, None, []
+    while True:
+        try:
+            conv_id, answers = read_history(p, nid)
+        except AuthError:
+            raise
+        except NlmError as e:
+            step(f"tarixni o'qib bo'lmadi: {str(e)[:120]}")
+        if len(answers) >= turns:
+            last = answers[-1]
+            if not looks_truncated(last) or last == prev_last:
+                return conv_id, answers
+            prev_last = last
+        if time.time() >= deadline:
+            if answers:
+                return conv_id, answers
+            raise NlmError("javob tarixda topilmadi")
+        step(f"tarixda javob kutilyapti ({len(answers)}/{turns} ta)")
+        time.sleep(HISTORY_POLL_SEC)
+
+
+def join_answers(answers: List[str]) -> str:
+    """Asosiy javob + davomlarni ulaydi ("TUGADI" belgisi va bo'sh davomlar tashlanadi)."""
+    parts = [answers[0]] if answers else []
+    for a in answers[1:]:
+        if a.strip().strip("«».! ").upper() != CONTINUE_DONE:
+            parts.append(a)
+    return "\n".join(parts)
+
+
+def recover_answer(p: str, nid: str, step) -> str:
+    """`ask` timeout bilan tugagach: javobni NotebookLM tarixidan oladi, qirqilgan bo'lsa shu suhbatda davom ettirtiradi.
+    HEAVY_ASK_SEM ichida chaqirilmaydi (kutish boshqa savollarni to'smasin); davomga so'rov yuborilganda semafor qisqa olinadi."""
+    step("ask timeout berdi, javob tarixdan qidirilmoqda")
+    turns = 1
+    for rnd in range(MAX_CONTINUATIONS + 1):
+        conv_id, answers = wait_history(p, nid, turns, step)
+        if len(answers) < turns:        # davom so'rovi tarixga tushmagan: bor narsani qaytaramiz
+            break
+        last_done = answers[-1].strip().strip("«».! ").upper() == CONTINUE_DONE   # model: "javob to'liq edi"
+        if last_done or not looks_truncated(answers[-1]) or rnd == MAX_CONTINUATIONS:
+            break
+        step(f"javob qirqilgan, davom ettirilmoqda ({rnd + 1}/{MAX_CONTINUATIONS})")
+        tail = answers[-1][-500:]
+        try:
+            with HEAVY_ASK_SEM:
+                with MemWatch(f"continue={nid[:8]}"):
+                    _ask_cmd(p, nid, CONTINUE_PROMPT.replace("{tail}", tail) + NO_QUESTION_RULE + LATIN_RULE,
+                             CUSTOM_ASK_BACKEND or None, conv_id=conv_id)
+        except AskStalled:
+            step("davom ham timeout berdi, natija tarixdan olinadi")
+        turns = len(answers) + 1
+    text = join_answers(answers)
+    if not text.strip():
+        raise NlmError("javob tarixda topilmadi")
+    step(f"javob tarixdan olindi ({len(answers)} bo'lak, {len(text)} belgi)")
+    return text
 
 
 def delete_notebook(profile: str, nid: str) -> bool:
@@ -710,10 +848,20 @@ def run_job(job: dict, acc: dict) -> dict:
         prompt = build_prompt(req)
         if custom:
             step("savol yuborilyapti (vaqtinchalik daftar)")
+            stalled: Optional[AskStalled] = None
+            raw = ""
             with HEAVY_ASK_SEM:   # RAM himoyasi: server bo'yicha bir vaqtda HEAVY_ASK_LIMIT ta savol (android bo'lsa ham)
                 step("savol navbatdan o'tdi")
                 with MemWatch(f"job={jid}"):
-                    raw = ask_custom(p, nid, prompt, step)
+                    try:
+                        raw = ask_custom(p, nid, prompt, step)
+                    except AskStalled as e:
+                        if not HISTORY_RECOVERY:
+                            raise
+                        stalled = e
+            if stalled is not None:   # semafordan tashqarida: tarixni kutish boshqa savollarni to'smaydi
+                print(f"[stall] job={jid} {p}: {str(stalled)[:150]}", flush=True)
+                raw = recover_answer(p, nid, step)
         else:
             ask_args = ["ask", "--notebook", nid] + (["--new", "--yes"] if RAW_MODE else []) + [prompt]
             ask = lambda: nlm(p, *ask_args, timeout=420, backend=ASK_BACKEND or None)

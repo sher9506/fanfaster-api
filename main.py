@@ -129,6 +129,12 @@ PRIVACY_RULE = (
 )
 QUOTA_WORDS = ("429", "quota", "limit exceeded", "rate limit", "resource exhausted")
 
+
+def _is_quota(e) -> bool:
+    """Kvota/limit xatosi (RESOURCE_EXHAUSTED ham: pastki chiziq probelga almashtiriladi)."""
+    t = str(e).lower().replace("_", " ")
+    return any(w in t for w in QUOTA_WORDS)
+
 NLM = shutil.which("notebooklm") or "notebooklm"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 UMUMIY_IDS = {a["umumiy"] for a in ACCOUNTS}
@@ -181,7 +187,7 @@ BAD_STATUSES = {"error", "failed"}
 SOURCE_FAIL_URL_MSG = "Manbalardan ba'zilarini ochib bo'lmadi. Havola o'rniga matnini «+ Matn» orqali qo'shing."
 SOURCE_FAIL_TEXT_MSG = "Manbalardan ba'zilarini qo'shib bo'lmadi. Qayta urinib ko'ring."
 
-TRANSIENT_WORDS = ("429", "rate", "quota", "limit", "timeout", "timed out", "temporar", "503", "500", "unavailable")
+TRANSIENT_WORDS = ("429", "rate limit", "quota", "limit", "timeout", "timed out", "temporar", "503", "500", "unavailable")
 AUTH_WORDS = ("auth", "login", "expired", "401", "403", "unauthorized", "sign in", "cookie")
 
 
@@ -305,6 +311,8 @@ def with_retry(fn, retries: Optional[int] = None):
         except (AuthError, AskStalled):
             raise
         except NlmError as e:
+            if _is_quota(e):
+                raise   # kvota: shu akkauntda qayta yubormaymiz (dublikat xavfi), worker boshqa akkauntga o'tkazadi
             transient = any(w in str(e).lower() for w in TRANSIENT_WORDS)
             if not transient or attempt == n:
                 raise
@@ -907,7 +915,7 @@ def worker(acc: dict):
             else:
                 job.update(status="error", finished=time.time(), error="AI xizmatiga ulanib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
         except Exception as e:  # noqa: BLE001
-            if isinstance(e, NlmError) and any(w in str(e).lower() for w in QUOTA_WORDS) \
+            if isinstance(e, NlmError) and _is_quota(e) \
                     and len(job["tried"] | {p}) < len(ACCOUNTS):
                 STATS[p]["fail"] += 1
                 STATS[p]["last_error"] = str(e)[:200]

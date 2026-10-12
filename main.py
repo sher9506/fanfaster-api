@@ -138,6 +138,12 @@ def _is_quota(e) -> bool:
 NLM = shutil.which("notebooklm") or "notebooklm"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 UMUMIY_IDS = {a["umumiy"] for a in ACCOUNTS}
+PROFILES = {a["profile"] for a in ACCOUNTS}
+# Nexus chat xotirasi: saqlanadigan daftarlar alohida prefiks bilan yaratiladi: NX-<epoch>-<sarlavha>.
+# Shu prefiks tufayli sweep endpoint'i (yetim daftarlar) Moot Court/vaqtinchalik "Kazus:" daftarlariga tegmaydi.
+KEEP_PREFIX = "NX-"
+NX_TITLE_RE = re.compile(r"^NX-(\d{9,11})-")
+NB_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 DEFAULT_PROMPT = (
     "Siz professional O'zbekiston huquqshunosisiz. "
@@ -492,7 +498,7 @@ def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Opt
         raise
 
 
-def ask_custom(p: str, nid: str, prompt: str, step) -> str:
+def ask_custom(p: str, nid: str, prompt: str, step, conv_id: Optional[str] = None) -> str:
     """Vaqtinchalik (manbali) daftarga savol. Javob hajmi oshib ketsa, bir marta android backend bilan qayta urinadi.
     Timeout bo'lsa AskStalled ko'tariladi: chaqiruvchi uni HEAVY_ASK_SEM TASHQARISIDA recover_answer bilan hal qiladi."""
     backends = [CUSTOM_ASK_BACKEND or None]
@@ -501,7 +507,7 @@ def ask_custom(p: str, nid: str, prompt: str, step) -> str:
     last: Optional[Exception] = None
     for be in backends:
         try:
-            return with_retry(lambda: _ask_cmd(p, nid, prompt, be))
+            return with_retry(lambda: _ask_cmd(p, nid, prompt, be, conv_id))
         except AuthError:
             raise
         except AskStalled:
@@ -564,11 +570,11 @@ def join_answers(answers: List[str]) -> str:
     return "\n".join(parts)
 
 
-def recover_answer(p: str, nid: str, step) -> str:
+def recover_answer(p: str, nid: str, step, base: int = 0) -> str:
     """`ask` timeout bilan tugagach: javobni NotebookLM tarixidan oladi, qirqilgan bo'lsa shu suhbatda davom ettirtiradi.
     HEAVY_ASK_SEM ichida chaqirilmaydi (kutish boshqa savollarni to'smasin); davomga so'rov yuborilganda semafor qisqa olinadi."""
     step("ask timeout berdi, javob tarixdan qidirilmoqda")
-    turns = 1
+    turns = base + 1   # base: chat davomida oldingi javoblar soni (tarixda ular ham bor)
     for rnd in range(MAX_CONTINUATIONS + 1):
         conv_id, answers = wait_history(p, nid, turns, step)
         if len(answers) < turns:        # davom so'rovi tarixga tushmagan: bor narsani qaytaramiz
@@ -586,7 +592,7 @@ def recover_answer(p: str, nid: str, step) -> str:
         except AskStalled:
             step("davom ham timeout berdi, natija tarixdan olinadi")
         turns = len(answers) + 1
-    text = join_answers(answers)
+    text = join_answers(answers[base:])
     if not text.strip():
         raise NlmError("javob tarixda topilmadi")
     step(f"javob tarixdan olindi ({len(answers)} bo'lak, {len(text)} belgi)")
@@ -803,20 +809,28 @@ def run_job(job: dict, acc: dict) -> dict:
     jid = job.get("id", "?")
     nid = acc["umumiy"]
     custom = False
+    reuse = bool(req.notebook_id)                       # chat davomi: mavjud daftar
+    keep = bool(req.keep_notebook) and not reuse        # chat boshi: yangi daftar saqlab qolinadi
+    keep_done = False                                   # javob olingach True: daftar o'chirilmaydi
+    nb_title = (f"{KEEP_PREFIX}{int(time.time())}-{req.title}" if keep else f"Kazus: {req.title}")[:80]
     t0 = time.time()
 
     def step(msg: str):
         print(f"[step] job={jid} {p} +{time.time() - t0:.0f}s mem={mem_mb()}MB {msg}", flush=True)
 
     try:
-        if req.sources:
-            step(f"daftar yaratilyapti ({len(req.sources)} manba keldi)")
-            out = with_retry(lambda: nlm(p, "create", f"Kazus: {req.title}"[:80], timeout=120))
-            m = UUID_RE.search(out)
-            if not m:
-                raise NlmError(f"daftar ID topilmadi: {out[:200]}")
-            nid, custom = m.group(0), True
-            to_add = group_sources(req.sources)[:MAX_SOURCES]
+        if reuse:
+            nid, custom = req.notebook_id, True
+            step(f"mavjud chat daftarida davom etiladi ({len(req.sources)} yangi manba)")
+        if req.sources or reuse:
+            if not reuse:
+                step(f"daftar yaratilyapti ({len(req.sources)} manba keldi{', saqlanadi' if keep else ''})")
+                out = with_retry(lambda: nlm(p, "create", nb_title, timeout=120))
+                m = UUID_RE.search(out)
+                if not m:
+                    raise NlmError(f"daftar ID topilmadi: {out[:200]}")
+                nid, custom = m.group(0), True
+            to_add = group_sources(req.sources)[:MAX_SOURCES] if req.sources else []
             if MAX_URLS:
                 kept, n_url = [], 0
                 for x in to_add:
@@ -847,9 +861,10 @@ def run_job(job: dict, acc: dict) -> dict:
                 kind, value = source_target(src)
                 step(f"manba {i}/{len(queue)} qo'shilyapti ({kind}, {len(value)} belgi)")
                 add_source(p, nid, src)
-            step("manbalar qo'shildi, indekslanishi kutilyapti")
-            wait_sources_ready(p, nid, max_wait=300 + 30 * len(to_add))   # 5 manba: 450s (avval 195s)
-            step("manbalar tayyor")
+            if to_add:
+                step("manbalar qo'shildi, indekslanishi kutilyapti")
+                wait_sources_ready(p, nid, max_wait=300 + 30 * len(to_add))   # 5 manba: 450s (avval 195s)
+                step("manbalar tayyor")
         else:
             step("manba yo'q, umumiy daftardan javob olinadi")
 
@@ -862,14 +877,14 @@ def run_job(job: dict, acc: dict) -> dict:
                 step("savol navbatdan o'tdi")
                 with MemWatch(f"job={jid}"):
                     try:
-                        raw = ask_custom(p, nid, prompt, step)
+                        raw = ask_custom(p, nid, prompt, step, conv_id=req.conversation_id if reuse else None)
                     except AskStalled as e:
                         if not HISTORY_RECOVERY:
                             raise
                         stalled = e
             if stalled is not None:   # semafordan tashqarida: tarixni kutish boshqa savollarni to'smaydi
                 print(f"[stall] job={jid} {p}: {str(stalled)[:150]}", flush=True)
-                raw = recover_answer(p, nid, step)
+                raw = recover_answer(p, nid, step, base=req.prior_turns if reuse else 0)
         else:
             ask_args = ["ask", "--notebook", nid] + (["--new", "--yes"] if RAW_MODE else []) + [prompt]
             ask = lambda: nlm(p, *ask_args, timeout=420, backend=ASK_BACKEND or None)
@@ -880,9 +895,22 @@ def run_job(job: dict, acc: dict) -> dict:
                     step("savol yuborilyapti")
                     raw = with_retry(ask)
         step("javob keldi")
-        return {"answer": clean_answer(raw, custom), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
+        res = {"answer": clean_answer(raw, custom), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
+        if custom and (keep or reuse):
+            conv_out = req.conversation_id if reuse else None
+            if not conv_out:
+                try:
+                    conv_out, _ = read_history(p, nid)
+                except NlmError as e:   # javob allaqachon bor: suhbat ID'si topilmasa ham yo'qotmaymiz
+                    step(f"suhbat ID'sini o'qib bo'lmadi: {str(e)[:120]}")
+            res.update(kept=True, profile=p, conversation_id=conv_out,
+                       conversation_turns=(req.prior_turns + 1) if reuse else 1)
+            keep_done = True
+            step("daftar chat uchun saqlab qolindi")
+        return res
     finally:
-        if custom:
+        # Saqlangan yoki davom etayotgan chat daftari bu yerda o'chirilmaydi (FanFaster 5 soatdan keyin o'chiradi)
+        if custom and not keep_done and not reuse:
             delete_notebook(p, nid)
             step("vaqtinchalik daftar o'chirildi")
 
@@ -893,6 +921,12 @@ def worker(acc: dict):
         job_id = QUEUE.get()
         job = JOBS.get(job_id)
         if not job:
+            continue
+        # Chat davomi faqat daftar egasi akkaunt ishchisida bajariladi (daftar boshqa akkauntda yo'q)
+        pinned = job["req"].profile if job["req"].notebook_id else None
+        if pinned and pinned != p:
+            QUEUE.put(job_id)
+            time.sleep(1)
             continue
         # Bu akkaunt allaqachon auth xatosi bergan ishni boshqa akkaunt olsin
         if p in job["tried"] and len(job["tried"]) < len(ACCOUNTS):
@@ -909,14 +943,14 @@ def worker(acc: dict):
             STATS[p].update(auth_ok=False, last_error=str(e)[:200])
             STATS[p]["fail"] += 1
             job["tried"].add(p)
-            if len(job["tried"]) < len(ACCOUNTS):
+            if not pinned and len(job["tried"]) < len(ACCOUNTS):
                 job["status"] = "queued"
                 QUEUE.put(job_id)
             else:
                 job.update(status="error", finished=time.time(), error="AI xizmatiga ulanib bo'lmadi. Birozdan keyin qayta urinib ko'ring.")
         except Exception as e:  # noqa: BLE001
             if isinstance(e, NlmError) and _is_quota(e) \
-                    and len(job["tried"] | {p}) < len(ACCOUNTS):
+                    and not pinned and len(job["tried"] | {p}) < len(ACCOUNTS):
                 STATS[p]["fail"] += 1
                 STATS[p]["last_error"] = str(e)[:200]
                 print(f"[job {job_id}] {p}: kvota tugadi, boshqa akkauntga o'tkazildi")
@@ -992,6 +1026,18 @@ class KazusRequest(BaseModel):
     sources: List[Source] = []
     instruction: Optional[str] = Field(default=None, max_length=4000)  # {kazus} joy belgisi bilan
     external_id: Optional[str] = Field(default=None, max_length=100)   # FanFaster jadvalidagi ID
+    # Nexus chat xotirasi (hammasi ixtiyoriy; berilmasa xizmat AVVALGIDEK ishlaydi)
+    keep_notebook: bool = False                                          # yangi daftar javobdan keyin o'chirilmasin
+    notebook_id: Optional[str] = Field(default=None, max_length=64)      # chat davomi: mavjud daftar
+    profile: Optional[str] = Field(default=None, max_length=64)          # daftar egasi akkaunt profili
+    conversation_id: Optional[str] = Field(default=None, max_length=128)
+    prior_turns: int = Field(default=0, ge=0, le=50)
+
+    @model_validator(mode="after")
+    def _check_chat(self):
+        if self.notebook_id and not self.profile:
+            raise ValueError("notebook_id bilan profile ham kerak")
+        return self
 
 
 def require_key(x_api_key: str = Header(default="")):
@@ -1029,6 +1075,11 @@ app.add_middleware(
 def create_job(req: KazusRequest):
     if len(req.sources) > MAX_SOURCES:
         raise HTTPException(422, f"Manbalar soni {MAX_SOURCES} tadan oshmasin")
+    if req.notebook_id:
+        if req.profile not in PROFILES:
+            raise HTTPException(422, "Noma'lum profil")
+        if not NB_ID_RE.match(req.notebook_id) or req.notebook_id in UMUMIY_IDS:
+            raise HTTPException(422, "Noto'g'ri daftar")
     if is_meta_request(req.kazus_text):
         print(f"[create] meta-so'rov rad etildi: {req.kazus_text[:80]!r}")
         raise HTTPException(422, META_REJECT_MSG)
@@ -1055,7 +1106,7 @@ def get_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Ish topilmadi (muddati o'tgan yoki server qayta ishga tushgan)")
-    return {
+    out = {
         "job_id": job_id,
         "status": job["status"],
         "external_id": job.get("external_id"),
@@ -1065,6 +1116,93 @@ def get_job(job_id: str):
         "used_account": job.get("account"),
         "elapsed_sec": round((job.get("finished") or time.time()) - job["created"], 1),
     }
+    # notebook_id/profile faqat saqlangan chat daftari uchun beriladi (umumiy daftar ID'si tashqariga chiqmaydi)
+    out["kept"] = bool(job.get("kept"))
+    if out["kept"]:
+        out.update(notebook_id=job.get("notebook_id"), profile=job.get("profile"),
+                   conversation_id=job.get("conversation_id"), conversation_turns=job.get("conversation_turns"))
+    return out
+
+
+class NotebookDeleteReq(BaseModel):
+    notebook_id: str = Field(max_length=64)
+    profile: str = Field(max_length=64)
+
+
+def delete_kept(profile: str, nid: str) -> None:
+    """Chat daftarini o'chiradi. Daftar allaqachon yo'q bo'lsa ham muvaffaqiyat; boshqa xatoda NlmError/AuthError ko'taradi."""
+    last: Optional[Exception] = None
+    for args in (("delete", "--notebook", nid, "--yes"), ("delete", "--notebook", nid), ("delete", nid)):
+        try:
+            nlm(profile, *args, timeout=60, stdin="y\n")
+            return
+        except AuthError:
+            raise
+        except NlmError as e:
+            low = str(e).lower()
+            if ("not found" in low or "does not exist" in low or "no such notebook" in low) \
+                    and "option" not in low and "command" not in low:
+                return
+            last = e
+    raise last or NlmError("delete bajarilmadi")
+
+
+@app.post("/api/notebooks/delete", dependencies=[Depends(require_key)])
+def delete_notebook_api(req: NotebookDeleteReq):
+    if req.profile not in PROFILES or not NB_ID_RE.match(req.notebook_id) or req.notebook_id in UMUMIY_IDS:
+        raise HTTPException(422, "Noto'g'ri profil yoki daftar")
+    try:
+        delete_kept(req.profile, req.notebook_id)
+    except AuthError:
+        raise HTTPException(502, "Akkauntga ulanib bo'lmadi")
+    except NlmError as e:
+        print(f"[delete-api] {req.profile} {req.notebook_id}: {e}", flush=True)
+        raise HTTPException(502, "O'chirib bo'lmadi")   # 5xx: FanFaster qayta urinadi (2xx faqat haqiqiy muvaffaqiyatda)
+    return {"deleted": True}
+
+
+class NotebookSweepReq(BaseModel):
+    max_age_hours: float = Field(default=7.0, ge=1.0, le=48.0)
+
+
+def list_nx_notebooks(profile: str):
+    """Akkauntdagi `NX-<epoch>-` daftarlari: [(id, epoch)]. Chiqish formati TEKSHIRILMAGAN: bir nechta shaklni qabul qiladi."""
+    out = nlm(profile, "list", "--json", timeout=90)
+    starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+    if not starts:
+        return []
+    data = json.loads(out[min(starts):])
+    items = data.get("notebooks", []) if isinstance(data, dict) else data
+    res = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        nid = str(it.get("id") or it.get("notebook_id") or "")
+        m = NX_TITLE_RE.match(str(it.get("title") or it.get("name") or ""))
+        if m and NB_ID_RE.match(nid) and nid not in UMUMIY_IDS:
+            res.append((nid, int(m.group(1))))
+    return res
+
+
+@app.post("/api/notebooks/sweep", dependencies=[Depends(require_key)])
+def sweep_notebooks(req: NotebookSweepReq):
+    """Yetim chat daftarlari uchun xavfsizlik to'ri: `NX-` prefiksli va max_age_hours dan eski daftarlarni o'chiradi.
+    FanFaster bazasidan mustaqil (Render qayta ishga tushsa yoki ish yozuvi yo'qolsa ham ishlaydi). Bir chaqiruvda ko'pi bilan 10 ta."""
+    now, deleted, errors = time.time(), 0, []
+    for prof in sorted(PROFILES):
+        try:
+            for nid, ts in list_nx_notebooks(prof):
+                if deleted >= 10:
+                    break
+                if now - ts > req.max_age_hours * 3600:
+                    try:
+                        delete_kept(prof, nid)
+                        deleted += 1
+                    except NlmError as e:
+                        errors.append(f"{prof}: {str(e)[:80]}")
+        except (NlmError, ValueError) as e:
+            errors.append(f"{prof}: list {str(e)[:80]}")
+    return {"deleted": deleted, "errors": errors}
 
 
 @app.get("/api/stats", dependencies=[Depends(require_key)])

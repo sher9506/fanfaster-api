@@ -84,6 +84,15 @@ MAX_CONTINUATIONS = max(int(os.environ.get("NLM_MAX_CONTINUATIONS", "2")), 0)   
 HISTORY_BACKEND = os.environ.get("NLM_HISTORY_BACKEND", "").strip().lower() or None
 HEAVY_ASK_LIMIT = max(int(os.environ.get("HEAVY_ASK_LIMIT", "1")), 1)    # bir vaqtda nechta umumiy-daftar savoli (butun server bo'yicha)
 HEAVY_ASK_SEM = threading.BoundedSemaphore(HEAVY_ASK_LIMIT)
+# NLM_LIBRARY=1 -> havolali manbalar (lex.uz) har safar qayta yuklanmaydi: har akkauntda "LIB-" daftarlari (kutubxona) bor,
+# hujjat u yerga BIR MARTA qo'shiladi, keyin vaqtinchalik daftarga `source copy` bilan ko'chiriladi (~5 s, qayta indekslanmaydi).
+# Kutubxona xato bersa, avtomatik eski usulga (to'g'ridan-to'g'ri qo'shish) qaytadi. 0 yoki bo'sh = eski xulq.
+LIBRARY = os.environ.get("NLM_LIBRARY", "").strip() == "1"
+LIB_PREFIX = "LIB-"
+LIB_MAX_SOURCES = max(int(os.environ.get("NLM_LIB_MAX_SOURCES", "45")), 1)   # bitta kutubxona daftaridagi manbalar (bepul akkaunt 50 ta)
+LIB_WAIT_SEC = max(int(os.environ.get("NLM_LIB_WAIT_SEC", "360")), 60)       # yangi hujjat kutubxonada tayyor bo'lishini kutish
+POLL_SEC = max(float(os.environ.get("NLM_POLL_SEC", "3")), 1.0)             # manbalar tayyorligini tekshirish oralig'i
+LEX_DOC_RE = re.compile(r"lex\.uz/(?:[a-z]{2}/)?docs/(-?\d+)", re.I)
 
 # NLM_RAW_MODE=1  -> LEXION Render: kazus matni o'zgarishsiz yuboriladi (prompt daftarning chat sozlamasida turadi),
 # javob tozalanmasdan qaytadi (toza JSON massiv), har savol yangi suhbatda beriladi (eski kazuslar aralashmasin).
@@ -230,6 +239,9 @@ UMUMIY_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}   # umumiy cha
 GAP_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}
 REFRESH_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}
 LAST_CALL = {a["profile"]: 0.0 for a in ACCOUNTS}
+LIB_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}      # kutubxonani o'qish/to'ldirish (akkaunt bo'yicha)
+LIB_INDEX = {a["profile"]: None for a in ACCOUNTS}                  # {hujjat kaliti: (kutubxona daftari, manba ID)}; None = o'qilmagan
+LIB_COUNTS = {a["profile"]: {} for a in ACCOUNTS}                   # {kutubxona daftari: manbalar soni}
 STATS = {
     a["profile"]: {"email": a["email"], "ok": 0, "fail": 0, "auth_ok": True, "last_error": None, "last_refresh": None}
     for a in ACCOUNTS
@@ -742,6 +754,132 @@ def add_urls_batch(p: str, nid: str, urls: List[str]) -> None:
     nlm(p, "source", "add-async", "--notebook", nid, "--", *urls, timeout=300)
 
 
+# ───────────────────────── KUTUBXONA (bir marta yuklash, keyin copy) ─────────────────────────
+def _json_out(out: str) -> dict:
+    """CLI `--json` chiqishidan JSON obyektni oladi (oldidagi log qatorlari tashlanadi). Xato javob bo'lsa NlmError."""
+    i = out.find("{")
+    if i < 0:
+        raise NlmError(f"JSON kelmadi: {out[:150]!r}")
+    try:
+        data = json.loads(out[i:])
+    except ValueError as e:
+        raise NlmError(f"JSON o'qilmadi: {e}")
+    if isinstance(data, dict) and data.get("error"):
+        raise NlmError(str(data.get("message") or data.get("code") or "noma'lum xato")[:300])
+    return data
+
+
+def lib_key(url: str) -> str:
+    """lex.uz havolasidan hujjat kaliti (http/https, www, til prefiksi farqi hisobga olinmaydi)."""
+    m = LEX_DOC_RE.search(url or "")
+    return f"lex:{m.group(1)}" if m else (url or "").strip().rstrip("/").lower().replace("https://", "http://")
+
+
+def lib_sources(p: str, nid: str) -> List[dict]:
+    return _json_out(nlm(p, "source", "list", "--notebook", nid, "--json", timeout=90)).get("sources", [])
+
+
+def lib_load(p: str) -> None:
+    """Akkauntdagi LIB- daftarlarini o'qib, indeksni quradi. LIB_LOCKS[p] ichida chaqiriladi."""
+    if LIB_INDEX[p] is not None:
+        return
+    index, counts = {}, {}
+    for nb in _json_out(nlm(p, "list", "--json", timeout=90)).get("notebooks", []):
+        if not str(nb.get("title") or "").startswith(LIB_PREFIX) or nb.get("is_owner") is False:
+            continue
+        srcs = lib_sources(p, nb["id"])
+        counts[nb["id"]] = len(srcs)
+        for s in srcs:
+            if s.get("status") == "ready" and s.get("url"):
+                index.setdefault(lib_key(s["url"]), (nb["id"], s["id"]))
+    LIB_INDEX[p], LIB_COUNTS[p] = index, counts
+    print(f"[lib] {p}: {len(counts)} ta kutubxona daftari, {len(index)} ta hujjat", flush=True)
+
+
+def lib_pick(p: str) -> str:
+    """Joyi bor kutubxona daftari; hammasi to'la bo'lsa yangisini yaratadi. LIB_LOCKS[p] ichida."""
+    for nid, n in LIB_COUNTS[p].items():
+        if n < LIB_MAX_SOURCES:
+            return nid
+    title = f"{LIB_PREFIX}{len(LIB_COUNTS[p]) + 1}"
+    nid = _json_out(nlm(p, "create", title, "--json", timeout=120))["notebook"]["id"]
+    LIB_COUNTS[p][nid] = 0
+    print(f"[lib] {p}: yangi kutubxona daftari {title} ({nid[:8]})", flush=True)
+    return nid
+
+
+def lib_add(p: str, urls: List[str], step) -> None:
+    """Kutubxonada yo'q havolalarni qo'shadi va tayyor bo'lishini kutadi. LIB_LOCKS[p] ichida.
+    Ochib bo'lmagan hujjat indeksga tushmaydi (chaqiruvchi uni eski usulda qo'shadi)."""
+    pending = list(dict.fromkeys(urls))
+    while pending:
+        nid = lib_pick(p)
+        room = LIB_MAX_SOURCES - LIB_COUNTS[p][nid]
+        chunk, pending = pending[:room], pending[room:]
+        res = _json_out(nlm(p, "source", "add-async", "--notebook", nid, "--json", "--", *chunk, timeout=300))
+        new_ids = {s["id"] for s in res.get("sources", []) if s.get("id")}
+        LIB_COUNTS[p][nid] += len(chunk)
+        deadline = time.time() + LIB_WAIT_SEC
+        while True:
+            srcs = [s for s in lib_sources(p, nid) if s.get("id") in new_ids]
+            if not any(s.get("status") in PENDING_STATUSES for s in srcs) or time.time() > deadline:
+                break
+            time.sleep(POLL_SEC)
+        for s in srcs:
+            if s.get("status") == "ready" and s.get("url"):
+                LIB_INDEX[p][lib_key(s["url"])] = (nid, s["id"])
+        bad = [s.get("url") or s.get("title") for s in srcs if s.get("status") != "ready"]
+        step(f"kutubxonaga {len(srcs) - len(bad)} ta hujjat qo'shildi" + (f", tayyor bo'lmadi: {bad}" if bad else ""))
+
+
+def lib_copy_into(p: str, nid: str, srcs: List["Source"], step) -> List["Source"]:
+    """Havolali manbalarni kutubxonadan `nid` ga ko'chiradi. Ko'chirib bo'lmaganlarini qaytaradi (ular eski usulda qo'shiladi)."""
+    copied: set = set()
+    try:
+        with LIB_LOCKS[p]:
+            lib_load(p)
+        urls = [source_target(x)[1] for x in srcs]
+        if any(lib_key(u) not in LIB_INDEX[p] for u in urls):
+            with LIB_LOCKS[p]:   # boshqa ish shu orada qo'shgan bo'lishi mumkin: qulf ichida qayta tekshiriladi
+                missing = [u for u in urls if lib_key(u) not in LIB_INDEX[p]]
+                if missing:
+                    step(f"kutubxonada yo'q: {len(missing)} ta, bir marta qo'shilyapti")
+                    lib_add(p, missing, step)
+        groups: dict = {}
+        for u in urls:
+            hit = LIB_INDEX[p].get(lib_key(u))
+            if hit:
+                groups.setdefault(hit[0], []).append((u, hit[1]))
+        for lib_nid, pairs in groups.items():
+            ids = list(dict.fromkeys(sid for _, sid in pairs))
+            _json_out(nlm(p, "source", "copy", *ids, "--notebook", lib_nid, "--to", nid, "--json", timeout=120))
+            copied.update(u for u, _ in pairs)
+        step(f"kutubxonadan {len(copied)}/{len(urls)} ta hujjat ko'chirildi")
+    except AuthError:
+        raise
+    except NlmError as e:
+        step(f"kutubxona xato berdi, qolganlari oddiy usulda qo'shiladi: {str(e)[:150]}")
+        with LIB_LOCKS[p]:
+            LIB_INDEX[p] = None   # keyingi ishda kutubxona qaytadan o'qiladi (o'chirilgan manba bo'lishi mumkin)
+    return [x for x in srcs if source_target(x)[1] not in copied]
+
+
+def lib_warm(urls: List[str]) -> None:
+    """Fon vazifasi: berilgan havolalarni har bir akkaunt kutubxonasiga oldindan qo'shadi."""
+    for acc in ACCOUNTS:
+        p = acc["profile"]
+        try:
+            with LIB_LOCKS[p]:
+                lib_load(p)
+                missing = [u for u in urls if lib_key(u) not in LIB_INDEX[p]]
+                if missing:
+                    lib_add(p, missing, lambda m, p=p: print(f"[lib warm] {p}: {m}", flush=True))
+        except NlmError as e:
+            print(f"[lib warm] {p}: {e}", flush=True)
+            with LIB_LOCKS[p]:
+                LIB_INDEX[p] = None
+
+
 def source_statuses(p: str, nid: str) -> List[str]:
     """`source list` jadvalidan har bir manbaning holatini (oxirgi ustun) o'qiydi."""
     out = nlm(p, "source", "list", "--notebook", nid, timeout=60)
@@ -780,7 +918,7 @@ def wait_sources_ready(p: str, nid: str, max_wait: int = 180) -> None:
             return
         if time.time() > deadline:
             raise SourceError(SOURCE_FAIL_TEXT_MSG, f"manbalar {max_wait}s ichida tayyor bo'lmadi: {st}")
-        time.sleep(5)
+        time.sleep(POLL_SEC)
 
 
 def group_sources(sources: List["Source"], max_chars: int = 250_000) -> List["Source"]:
@@ -846,6 +984,10 @@ def run_job(job: dict, acc: dict) -> dict:
             step(f"havola ID'lari: {ids}")
             step(f"daftar tayyor, {len(to_add)} ta manba qo'shiladi")
             url_srcs = [x for x in to_add if source_target(x)[0] == "url"]
+            if LIBRARY and url_srcs:
+                left = lib_copy_into(p, nid, url_srcs, step)
+                to_add = [x for x in to_add if source_target(x)[0] != "url" or x in left]
+                url_srcs = left
             batched = False
             if BATCH_URLS and len(url_srcs) >= 2:
                 try:
@@ -861,7 +1003,7 @@ def run_job(job: dict, acc: dict) -> dict:
                 kind, value = source_target(src)
                 step(f"manba {i}/{len(queue)} qo'shilyapti ({kind}, {len(value)} belgi)")
                 add_source(p, nid, src)
-            if to_add:
+            if to_add or (LIBRARY and req.sources):
                 step("manbalar qo'shildi, indekslanishi kutilyapti")
                 wait_sources_ready(p, nid, max_wait=300 + 30 * len(to_add))   # 5 manba: 450s (avval 195s)
                 step("manbalar tayyor")
@@ -911,8 +1053,9 @@ def run_job(job: dict, acc: dict) -> dict:
     finally:
         # Saqlangan yoki davom etayotgan chat daftari bu yerda o'chirilmaydi (FanFaster 5 soatdan keyin o'chiradi)
         if custom and not keep_done and not reuse:
-            delete_notebook(p, nid)
-            step("vaqtinchalik daftar o'chirildi")
+            # fonda: javob o'chirishni kutmasdan darhol qaytadi
+            threading.Thread(target=delete_notebook, args=(p, nid), daemon=True).start()
+            step("vaqtinchalik daftar o'chirilmoqda (fonda)")
 
 
 def worker(acc: dict):
@@ -1205,12 +1348,28 @@ def sweep_notebooks(req: NotebookSweepReq):
     return {"deleted": deleted, "errors": errors}
 
 
+class LibraryWarmReq(BaseModel):
+    urls: List[str] = Field(min_length=1, max_length=300)
+
+
+@app.post("/api/library/warm", dependencies=[Depends(require_key)])
+def library_warm(req: LibraryWarmReq):
+    """Ko'p ishlatiladigan hujjatlarni (kodekslar va h.k.) har bir akkaunt kutubxonasiga oldindan qo'shadi. Fonda ishlaydi."""
+    if not LIBRARY:
+        raise HTTPException(409, "Kutubxona o'chirilgan (NLM_LIBRARY=1 qo'ying)")
+    urls = [u.strip() for u in req.urls if URL_ONLY_RE.match(u.strip())]
+    threading.Thread(target=lib_warm, args=(urls,), daemon=True).start()
+    return {"started": True, "urls": len(urls)}
+
+
 @app.get("/api/stats", dependencies=[Depends(require_key)])
 def stats():
     master = {a["profile"]: os.path.exists(os.path.expanduser(f"~/.notebooklm/profiles/{a['profile']}/master_token.json"))
               for a in ACCOUNTS}
+    library = {p: {"docs": len(LIB_INDEX[p]) if LIB_INDEX[p] is not None else None, "notebooks": len(LIB_COUNTS[p])}
+               for p in PROFILES} if LIBRARY else False
     return {"raw_mode": RAW_MODE, "queue_size": QUEUE.qsize(), "ask_backend": ASK_BACKEND or "web", "custom_ask_backend": CUSTOM_ASK_BACKEND or "web", "batch_urls": BATCH_URLS, "heavy_ask_limit": HEAVY_ASK_LIMIT,
-            "master_token_present": master, "accounts": STATS}
+            "library": library, "master_token_present": master, "accounts": STATS}
 
 
 @app.get("/")

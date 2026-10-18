@@ -305,11 +305,7 @@ def ensure_session(profile: str, force: bool = False) -> bool:
 def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = None,
         backend: Optional[str] = None, _retried: bool = False) -> str:
     """notebooklm CLI'ni bitta akkaunt (profil) nomidan chaqiradi. Chaqiruvlar orasida pauza qo'yadi."""
-    with GAP_LOCKS[profile]:
-        wait = MIN_GAP_SEC - (time.time() - LAST_CALL[profile])
-        if wait > 0:
-            time.sleep(wait)
-        LAST_CALL[profile] = time.time()
+    _gap(profile)
     try:
         cmd = [NLM, "-p", profile] + (["--backend", backend] if backend else []) + list(args)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=stdin)
@@ -324,6 +320,96 @@ def nlm(profile: str, *args: str, timeout: int = 300, stdin: Optional[str] = Non
             raise AuthError(msg)
         raise NlmError(msg)
     return r.stdout.strip()
+
+
+def _gap(profile: str) -> None:
+    """Bitta akkauntning ketma-ket chaqiruvlari orasida MIN_GAP_SEC pauza (CLI ham, API ham)."""
+    with GAP_LOCKS[profile]:
+        wait = MIN_GAP_SEC - (time.time() - LAST_CALL[profile])
+        if wait > 0:
+            time.sleep(wait)
+        LAST_CALL[profile] = time.time()
+
+
+# ───────────────────────── PYTHON API (CLI o'rniga) ─────────────────────────
+# NLM_PY_API=1 (standart): asosiy yo'l (create, copy, source list, ask, delete, rename) notebooklm-py kutubxonasi
+# orqali shu jarayon ichida bajariladi -- har chaqiruvda CLI'ni ishga tushirish (2-4 s) bo'lmaydi. 0 = eski CLI xulqi.
+PY_API = os.environ.get("NLM_PY_API", "1").strip() != "0"
+_API_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_API_LOOP_LOCK = threading.Lock()
+_API_CLIENTS: dict = {}   # (profil, backend) -> Future[(kontekst, client)]; faqat _API_LOOP ichida o'zgartiriladi
+
+
+def _api_loop() -> asyncio.AbstractEventLoop:
+    """Barcha profil klientlari uchun bitta fon event loop (klient o'zi yaratilgan loop'ga bog'langan)."""
+    global _API_LOOP
+    with _API_LOOP_LOCK:
+        if _API_LOOP is None:
+            _API_LOOP = asyncio.new_event_loop()
+            threading.Thread(target=_API_LOOP.run_forever, daemon=True, name="nlm-api").start()
+    return _API_LOOP
+
+
+async def _open_client(p: str, backend: Optional[str]):
+    from notebooklm import NotebookLMClient
+    kw = {"chat_response_max_bytes": CHAT_MAX_MB * 1024 * 1024} if CHAT_MAX_MB else {}
+    ctx = NotebookLMClient.from_storage(profile=p, backend=backend, **kw)
+    return ctx, await ctx.__aenter__()
+
+
+async def _api_client(p: str, backend: Optional[str]):
+    key = (p, backend)
+    fut = _API_CLIENTS.get(key)
+    if fut is None:   # bir vaqtda kelgan chaqiruvlar bitta klientni kutadi (ikki marta ochilmaydi)
+        fut = _API_CLIENTS[key] = asyncio.ensure_future(_open_client(p, backend))
+    try:
+        return (await asyncio.shield(fut))[1]
+    except Exception:
+        _API_CLIENTS.pop(key, None)
+        raise
+
+
+async def _api_drop(p: str, backend: Optional[str]) -> None:
+    """Xatodan keyin klient yopiladi: keyingi chaqiruv cookie'ni diskdan yangidan o'qiydi (auth refresh'dan keyin ham)."""
+    fut = _API_CLIENTS.pop((p, backend), None)
+    if fut is not None and fut.done() and not fut.cancelled() and fut.exception() is None:
+        try:
+            await fut.result()[0].__aexit__(None, None, None)
+        except Exception:   # noqa: BLE001 -- yopishdagi xato muhim emas
+            pass
+
+
+def api(p: str, op, backend: Optional[str] = None, timeout: int = 300):
+    """op(client) korutinasini profil klienti bilan bajaradi. Kutubxona xatolari NlmError/AuthError'ga aylanadi."""
+    import concurrent.futures
+    _gap(p)
+
+    async def run():
+        client = await _api_client(p, backend)
+        try:
+            return await op(client)
+        except Exception:
+            await _api_drop(p, backend)
+            raise
+
+    fut = asyncio.run_coroutine_threadsafe(run(), _api_loop())
+    try:
+        return fut.result(timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        raise NlmError("timeout: NotebookLM javob bermadi")
+    except Exception as e:
+        from notebooklm.exceptions import AuthError as LibAuthError
+        msg = f"{type(e).__name__}: {e}"[:500]
+        if isinstance(e, LibAuthError):
+            raise AuthError(msg) from e
+        raise NlmError(msg) from e
+
+
+def create_notebook(p: str, title: str) -> str:
+    if PY_API:
+        return api(p, lambda c: c.notebooks.create(title), timeout=120).id
+    return _json_out(nlm(p, "create", title, "--json", timeout=120))["notebook"]["id"]
 
 
 def with_retry(fn, retries: Optional[int] = None):
@@ -508,6 +594,10 @@ def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Opt
     """Bitta `ask` chaqiruvi. Timeout/DEADLINE_EXCEEDED bo'lsa AskStalled ko'taradi (with_retry savolni qayta yubormaydi)."""
     args = ["ask", "--notebook", nid] + (["-c", conv_id] if conv_id else []) + [prompt]
     try:
+        if PY_API:
+            r = api(p, lambda c: c.chat.ask(nid, prompt, conversation_id=conv_id), backend=backend, timeout=ASK_TIMEOUT)
+            # "Conversation: <id>" qatori clean_answer'da tashlanadi, suhbat ID'si esa run_job'da shu qatordan olinadi
+            return f"{r.answer}\nConversation: {r.conversation_id}" if r.conversation_id else r.answer
         return nlm(p, *args, timeout=ASK_TIMEOUT, backend=backend)
     except AuthError:
         raise
@@ -622,6 +712,12 @@ def delete_notebook(profile: str, nid: str) -> bool:
     """Faqat vaqtinchalik daftarni o'chiradi. Umumiy daftarlarga hech qachon tegmaydi."""
     if not nid or nid in UMUMIY_IDS:
         return False
+    if PY_API:
+        try:
+            api(profile, lambda c: c.notebooks.delete(nid), timeout=60)
+            return True
+        except NlmError as e:
+            print(f"[delete] {profile} {nid}: API xato, CLI bilan urinib ko'riladi: {str(e)[:150]}")
     for args in (("delete", "--notebook", nid, "--yes"), ("delete", "--notebook", nid), ("delete", nid)):
         try:
             nlm(profile, *args, timeout=60, stdin="y\n")
@@ -783,6 +879,9 @@ def lib_key(url: str) -> str:
 
 
 def lib_sources(p: str, nid: str) -> List[dict]:
+    if PY_API:
+        return [{"id": x.id, "url": x.url, "status": x.status.name.lower()}
+                for x in api(p, lambda c: c.sources.list(nid), timeout=90)]
     return _json_out(nlm(p, "source", "list", "--notebook", nid, "--json", timeout=90)).get("sources", [])
 
 
@@ -809,7 +908,7 @@ def lib_pick(p: str) -> str:
         if n < LIB_MAX_SOURCES:
             return nid
     title = f"{LIB_PREFIX}{len(LIB_COUNTS[p]) + 1}"
-    nid = _json_out(nlm(p, "create", title, "--json", timeout=120))["notebook"]["id"]
+    nid = create_notebook(p, title)
     LIB_COUNTS[p][nid] = 0
     print(f"[lib] {p}: yangi kutubxona daftari {title} ({nid[:8]})", flush=True)
     return nid
@@ -863,7 +962,10 @@ def lib_copy_into(p: str, nid: str, srcs: List["Source"], step) -> List["Source"
                 groups.setdefault(hit[0], []).append((u, hit[1]))
         for lib_nid, pairs in groups.items():
             ids = list(dict.fromkeys(sid for _, sid in pairs))
-            _json_out(nlm(p, "source", "copy", *ids, "--notebook", lib_nid, "--to", nid, "--json", timeout=120))
+            if PY_API:
+                api(p, lambda c: c.sources.copy(lib_nid, ids, nid), timeout=120)
+            else:
+                _json_out(nlm(p, "source", "copy", *ids, "--notebook", lib_nid, "--to", nid, "--json", timeout=120))
             copied.update(u for u, _ in pairs)
         step(f"kutubxonadan {len(copied)}/{len(urls)} ta hujjat ko'chirildi")
     except AuthError:
@@ -901,7 +1003,7 @@ def lib_warm(urls: List[str]) -> None:
 def pool_fill(p: str) -> None:
     """Bitta bo'sh daftarni oldindan yaratadi. Sarlavha NX- bilan: ishlatilmay qolsa, sweep 7 soatda o'chiradi."""
     try:
-        nid = _json_out(nlm(p, "create", f"{KEEP_PREFIX}{int(time.time())}-zaxira", "--json", timeout=120))["notebook"]["id"]
+        nid = create_notebook(p, f"{KEEP_PREFIX}{int(time.time())}-zaxira")
         with POOL_LOCK:
             POOL[p].append(nid)
     except NlmError as e:
@@ -918,13 +1020,18 @@ def pool_take(p: str) -> Optional[str]:
 
 def rename_quiet(p: str, nid: str, title: str) -> None:
     try:
-        nlm(p, "rename", "-n", nid, title, timeout=60)
+        if PY_API:
+            api(p, lambda c: c.notebooks.rename(nid, title), timeout=60)
+        else:
+            nlm(p, "rename", "-n", nid, title, timeout=60)
     except NlmError as e:
         print(f"[pool] {p}: rename {nid[:8]}: {str(e)[:150]}", flush=True)
 
 
 def source_statuses(p: str, nid: str) -> List[str]:
     """`source list` jadvalidan har bir manbaning holatini (oxirgi ustun) o'qiydi."""
+    if PY_API:
+        return [x["status"] for x in lib_sources(p, nid)]
     out = nlm(p, "source", "list", "--notebook", nid, timeout=60)
     res = []
     for line in out.splitlines():
@@ -1012,11 +1119,7 @@ def run_job(job: dict, acc: dict) -> dict:
                     threading.Thread(target=rename_quiet, args=(p, nid, nb_title), daemon=True).start()
             elif not reuse:
                 step(f"daftar yaratilyapti ({len(req.sources)} manba keldi{', saqlanadi' if keep else ''})")
-                out = with_retry(lambda: nlm(p, "create", nb_title, timeout=120))
-                m = UUID_RE.search(out)
-                if not m:
-                    raise NlmError(f"daftar ID topilmadi: {out[:200]}")
-                nid, custom = m.group(0), True
+                nid, custom = with_retry(lambda: create_notebook(p, nb_title)), True
             to_add = group_sources(req.sources)[:MAX_SOURCES] if req.sources else []
             if MAX_URLS:
                 kept, n_url = [], 0

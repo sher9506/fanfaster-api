@@ -93,6 +93,11 @@ LIB_MAX_SOURCES = max(int(os.environ.get("NLM_LIB_MAX_SOURCES", "45")), 1)   # b
 LIB_WAIT_SEC = max(int(os.environ.get("NLM_LIB_WAIT_SEC", "360")), 60)       # yangi hujjat kutubxonada tayyor bo'lishini kutish
 POLL_SEC = max(float(os.environ.get("NLM_POLL_SEC", "3")), 1.0)             # manbalar tayyorligini tekshirish oralig'i
 LEX_DOC_RE = re.compile(r"lex\.uz/(?:[a-z]{2}/)?docs/(-?\d+)", re.I)
+LIB_LOCK_WAIT = 30   # kutubxona band bo'lsa (masalan oldindan to'ldirish), shuncha kutib eski usulga o'tiladi
+# Server ishga tushganda har akkaunt kutubxonasiga oldindan qo'shiladigan hujjatlar: Lexion katalogidagi 20 ta kodeks
+LIB_WARM_URLS = [f"http://lex.uz/docs/{d}" for d in (
+    "111453", "111460", "111189", "180552", "6257288", "104720", "97664", "3517337", "3523891", "3527353",
+    "163629", "106136", "152653", "4674902", "2876354", "2304138", "5307951", "4386848", "7655343", "55594")]
 
 # NLM_RAW_MODE=1  -> LEXION Render: kazus matni o'zgarishsiz yuboriladi (prompt daftarning chat sozlamasida turadi),
 # javob tozalanmasdan qaytadi (toza JSON massiv), har savol yangi suhbatda beriladi (eski kazuslar aralashmasin).
@@ -242,6 +247,8 @@ LAST_CALL = {a["profile"]: 0.0 for a in ACCOUNTS}
 LIB_LOCKS = {a["profile"]: threading.Lock() for a in ACCOUNTS}      # kutubxonani o'qish/to'ldirish (akkaunt bo'yicha)
 LIB_INDEX = {a["profile"]: None for a in ACCOUNTS}                  # {hujjat kaliti: (kutubxona daftari, manba ID)}; None = o'qilmagan
 LIB_COUNTS = {a["profile"]: {} for a in ACCOUNTS}                   # {kutubxona daftari: manbalar soni}
+POOL = {a["profile"]: [] for a in ACCOUNTS}                         # oldindan yaratilgan bo'sh daftarlar (create'ni kutmaslik uchun)
+POOL_LOCK = threading.Lock()
 STATS = {
     a["profile"]: {"email": a["email"], "ok": 0, "fail": 0, "auth_ok": True, "last_error": None, "last_refresh": None}
     for a in ACCOUNTS
@@ -836,15 +843,19 @@ def lib_copy_into(p: str, nid: str, srcs: List["Source"], step) -> List["Source"
     """Havolali manbalarni kutubxonadan `nid` ga ko'chiradi. Ko'chirib bo'lmaganlarini qaytaradi (ular eski usulda qo'shiladi)."""
     copied: set = set()
     try:
-        with LIB_LOCKS[p]:
-            lib_load(p)
         urls = [source_target(x)[1] for x in srcs]
-        if any(lib_key(u) not in LIB_INDEX[p] for u in urls):
-            with LIB_LOCKS[p]:   # boshqa ish shu orada qo'shgan bo'lishi mumkin: qulf ichida qayta tekshiriladi
-                missing = [u for u in urls if lib_key(u) not in LIB_INDEX[p]]
+        # Qulf faqat kutubxonani o'qish/to'ldirish uchun; hujjatlari tayyor ish boshqasining yuklashini kutmaydi
+        if LIB_INDEX[p] is None or any(lib_key(u) not in LIB_INDEX[p] for u in urls):
+            if not LIB_LOCKS[p].acquire(timeout=LIB_LOCK_WAIT):
+                raise LibBusy("kutubxona band (boshqa hujjatlar yuklanyapti)")
+            try:
+                lib_load(p)
+                missing = [u for u in urls if lib_key(u) not in LIB_INDEX[p]]   # boshqa ish shu orada qo'shgan bo'lishi mumkin
                 if missing:
                     step(f"kutubxonada yo'q: {len(missing)} ta, bir marta qo'shilyapti")
                     lib_add(p, missing, step)
+            finally:
+                LIB_LOCKS[p].release()
         groups: dict = {}
         for u in urls:
             hit = LIB_INDEX[p].get(lib_key(u))
@@ -858,26 +869,58 @@ def lib_copy_into(p: str, nid: str, srcs: List["Source"], step) -> List["Source"
     except AuthError:
         raise
     except NlmError as e:
-        step(f"kutubxona xato berdi, qolganlari oddiy usulda qo'shiladi: {str(e)[:150]}")
-        with LIB_LOCKS[p]:
+        step(f"kutubxona ishlatilmadi, qolganlari oddiy usulda qo'shiladi: {str(e)[:150]}")
+        if not isinstance(e, LibBusy):
             LIB_INDEX[p] = None   # keyingi ishda kutubxona qaytadan o'qiladi (o'chirilgan manba bo'lishi mumkin)
     return [x for x in srcs if source_target(x)[1] not in copied]
 
 
+class LibBusy(NlmError):
+    """Kutubxona qulfi LIB_LOCK_WAIT ichida bo'shamadi: ish eski usulda davom etadi, indeks tegilmaydi."""
+
+
 def lib_warm(urls: List[str]) -> None:
-    """Fon vazifasi: berilgan havolalarni har bir akkaunt kutubxonasiga oldindan qo'shadi."""
+    """Fon vazifasi: har akkaunt kutubxonasini o'qiydi (B) va berilgan hujjatlarni oldindan qo'shadi (A).
+    O'qish va qo'shish alohida qulf olishda: indeks o'qilgach, hujjatlari tayyor ishlar kutmaydi."""
     for acc in ACCOUNTS:
         p = acc["profile"]
+        log = lambda m, p=p: print(f"[lib warm] {p}: {m}", flush=True)
         try:
             with LIB_LOCKS[p]:
                 lib_load(p)
+            with LIB_LOCKS[p]:
                 missing = [u for u in urls if lib_key(u) not in LIB_INDEX[p]]
                 if missing:
-                    lib_add(p, missing, lambda m, p=p: print(f"[lib warm] {p}: {m}", flush=True))
+                    log(f"{len(missing)} ta hujjat oldindan qo'shilyapti")
+                    lib_add(p, missing, log)
         except NlmError as e:
-            print(f"[lib warm] {p}: {e}", flush=True)
-            with LIB_LOCKS[p]:
-                LIB_INDEX[p] = None
+            log(str(e)[:200])
+            LIB_INDEX[p] = None
+
+
+def pool_fill(p: str) -> None:
+    """Bitta bo'sh daftarni oldindan yaratadi. Sarlavha NX- bilan: ishlatilmay qolsa, sweep 7 soatda o'chiradi."""
+    try:
+        nid = _json_out(nlm(p, "create", f"{KEEP_PREFIX}{int(time.time())}-zaxira", "--json", timeout=120))["notebook"]["id"]
+        with POOL_LOCK:
+            POOL[p].append(nid)
+    except NlmError as e:
+        print(f"[pool] {p}: {str(e)[:200]}", flush=True)
+
+
+def pool_take(p: str) -> Optional[str]:
+    """Tayyor bo'sh daftarni oladi (yo'q bo'lsa None) va o'rniga fonda yangisini yaratadi."""
+    with POOL_LOCK:
+        nid = POOL[p].pop() if POOL[p] else None
+    threading.Thread(target=pool_fill, args=(p,), daemon=True).start()
+    return nid
+
+
+def rename_quiet(p: str, nid: str, title: str) -> None:
+    try:
+        nlm(p, "rename", "-n", nid, title, timeout=60)
+    except NlmError as e:
+        print(f"[pool] {p}: rename {nid[:8]}: {str(e)[:150]}", flush=True)
 
 
 def source_statuses(p: str, nid: str) -> List[str]:
@@ -961,7 +1004,13 @@ def run_job(job: dict, acc: dict) -> dict:
             nid, custom = req.notebook_id, True
             step(f"mavjud chat daftarida davom etiladi ({len(req.sources)} yangi manba)")
         if req.sources or reuse:
-            if not reuse:
+            pooled = pool_take(p) if LIBRARY and not reuse else None
+            if pooled:
+                nid, custom = pooled, True
+                step(f"zaxiradagi tayyor daftar olindi ({len(req.sources)} manba keldi{', saqlanadi' if keep else ''})")
+                if keep:   # chat daftari to'g'ri sarlavha olsin (sweep yoshi shundan hisoblanadi); fonda, javobni kutdirmaydi
+                    threading.Thread(target=rename_quiet, args=(p, nid, nb_title), daemon=True).start()
+            elif not reuse:
                 step(f"daftar yaratilyapti ({len(req.sources)} manba keldi{', saqlanadi' if keep else ''})")
                 out = with_retry(lambda: nlm(p, "create", nb_title, timeout=120))
                 m = UUID_RE.search(out)
@@ -1039,13 +1088,10 @@ def run_job(job: dict, acc: dict) -> dict:
         step("javob keldi")
         res = {"answer": clean_answer(raw, custom), "notebook_type": "custom_new" if custom else "umumiy", "notebook_id": nid}
         if custom and (keep or reuse):
-            conv_out = req.conversation_id if reuse else None
-            if not conv_out:
-                try:
-                    conv_out, _ = read_history(p, nid)
-                except NlmError as e:   # javob allaqachon bor: suhbat ID'si topilmasa ham yo'qotmaymiz
-                    step(f"suhbat ID'sini o'qib bo'lmadi: {str(e)[:120]}")
-            res.update(kept=True, profile=p, conversation_id=conv_out,
+            # Suhbat ID'si alohida `history` bilan o'qilmaydi (~8 s): `ask` chiqishidagi "... conversation: <id>" qatoridan olinadi.
+            # Topilmasa ham zarar yo'q: chat daftarida bitta suhbat bor, `ask` -c'siz o'shani davom ettiradi (sinalgan).
+            conv_m = re.search(r"(?i)conversation:?\s*(" + UUID_RE.pattern + ")", raw or "")
+            res.update(kept=True, profile=p, conversation_id=req.conversation_id if reuse else (conv_m.group(1) if conv_m else None),
                        conversation_turns=(req.prior_turns + 1) if reuse else 1)
             keep_done = True
             step("daftar chat uchun saqlab qolindi")
@@ -1202,6 +1248,10 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=janitor, daemon=True).start()
     if AUTH_REFRESH_HOURS > 0:
         threading.Thread(target=auth_refresher, daemon=True).start()
+    if LIBRARY:   # fonda: birinchi so'rov kutubxona o'qilishini va daftar yaratilishini kutmasin
+        threading.Thread(target=lib_warm, args=(LIB_WARM_URLS,), daemon=True).start()
+        for acc in ACCOUNTS:
+            threading.Thread(target=pool_fill, args=(acc["profile"],), daemon=True).start()
     yield
 
 

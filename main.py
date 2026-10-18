@@ -1043,8 +1043,10 @@ def source_statuses(p: str, nid: str) -> List[str]:
     return res
 
 
-def wait_sources_ready(p: str, nid: str, max_wait: int = 180) -> None:
+def wait_sources_ready(p: str, nid: str, max_wait: int = 180, tolerate: bool = False) -> None:
     """Manbalar tayyor bo'lguncha kutadi; xato holatdagi manba bo'lsa, ishni to'xtatadi.
+    tolerate=True (faqat lex.uz havolalari): bittasi xato bo'lsa ham, qolganlari tayyor bo'lsa davom etadi —
+    NotebookLM nusxalashda ba'zan tasodifan 'error' beradi, butun javobni bekor qilish shart emas.
     `source list` o'qib bo'lmasa, 3 marta qayta urinadi — xatolik bilan davom etmaydi."""
     deadline = time.time() + max_wait
     read_errors = 0
@@ -1061,10 +1063,13 @@ def wait_sources_ready(p: str, nid: str, max_wait: int = 180) -> None:
                 raise SourceError(SOURCE_FAIL_TEXT_MSG, f"source list 3 marta xato: {e}")
             time.sleep(5)
             continue
-        if any(s in BAD_STATUSES for s in st):
+        bad = sum(s in BAD_STATUSES for s in st)
+        if bad and not (tolerate and bad < len(st)):
             raise SourceError(SOURCE_FAIL_URL_MSG if any("url" in s for s in st) else SOURCE_FAIL_TEXT_MSG,
                               f"manba holati xato: {st}")
         if not any(s in PENDING_STATUSES for s in st):
+            if bad:
+                print(f"[wait_sources] {p}: {bad}/{len(st)} ta hujjat xato holatda, qolganlari bilan davom etiladi", flush=True)
             return
         if time.time() > deadline:
             raise SourceError(SOURCE_FAIL_TEXT_MSG, f"manbalar {max_wait}s ichida tayyor bo'lmadi: {st}")
@@ -1157,7 +1162,8 @@ def run_job(job: dict, acc: dict) -> dict:
                 add_source(p, nid, src)
             if to_add or (LIBRARY and req.sources):
                 step("manbalar qo'shildi, indekslanishi kutilyapti")
-                wait_sources_ready(p, nid, max_wait=300 + 30 * len(to_add))   # 5 manba: 450s (avval 195s)
+                only_lex = bool(req.sources) and all(LEX_URL_RE.match(source_target(x)[1]) for x in req.sources)
+                wait_sources_ready(p, nid, max_wait=300 + 30 * len(to_add), tolerate=only_lex)   # 5 manba: 450s
                 step("manbalar tayyor")
         else:
             step("manba yo'q, umumiy daftardan javob olinadi")

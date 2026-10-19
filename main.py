@@ -898,19 +898,45 @@ def lib_sources(p: str, nid: str) -> List[dict]:
     return _json_out(nlm(p, "source", "list", "--notebook", nid, "--json", timeout=90)).get("sources", [])
 
 
+def _central_sources(p: str) -> List[tuple]:
+    """Markaziy kutubxona daftarlarini parallel o'qiydi (navbat bilan 69 daftar ~3,5 daqiqa olardi, Render uyg'onishini sekinlashtirardi).
+    O'qib bo'lmagan daftar (ulashilmagan/o'chirilgan) tashlab ketiladi."""
+    if not CENTRAL_LIB_IDS:
+        return []
+    if not PY_API:
+        out = []
+        for nid in CENTRAL_LIB_IDS:
+            try:
+                out.append((nid, lib_sources(p, nid)))
+            except NlmError as e:
+                print(f"[lib] {p}: markaziy daftar {nid[:8]} o'qilmadi: {str(e)[:120]}", flush=True)
+        return out
+
+    async def read_all(c):
+        sem = asyncio.Semaphore(8)   # NotebookLM'ni bir vaqtda 8 tadan ortiq so'rov bilan bosmaymiz
+
+        async def one(nid):
+            async with sem:
+                try:
+                    return nid, [{"id": x.id, "url": x.url, "status": x.status.name.lower()} for x in await c.sources.list(nid)]
+                except Exception as e:   # noqa: BLE001
+                    print(f"[lib] {p}: markaziy daftar {nid[:8]} o'qilmadi: {str(e)[:120]}", flush=True)
+                    return nid, []
+        return await asyncio.gather(*(one(n) for n in CENTRAL_LIB_IDS))
+
+    return api(p, read_all, timeout=300)
+
+
 def lib_load(p: str) -> None:
     """Akkauntdagi LIB- daftarlarini va markaziy kutubxonani o'qib, indeksni quradi. LIB_LOCKS[p] ichida chaqiriladi."""
     if LIB_INDEX[p] is not None:
         return
     index, counts = {}, {}
     # markaziy kutubxona birinchi: hujjat u yerda bo'lsa, o'z kutubxonasiga qayta yuklanmaydi
-    for nid in CENTRAL_LIB_IDS:
-        try:
-            for s in lib_sources(p, nid):
-                if s.get("status") == "ready" and s.get("url"):
-                    index.setdefault(lib_key(s["url"]), (nid, s["id"]))
-        except NlmError as e:   # ulashilmagan yoki o'chirilgan daftar ishni to'xtatmasin
-            print(f"[lib] {p}: markaziy daftar {nid[:8]} o'qilmadi: {str(e)[:120]}", flush=True)
+    for nid, srcs in _central_sources(p):
+        for s in srcs:
+            if s.get("status") == "ready" and s.get("url"):
+                index.setdefault(lib_key(s["url"]), (nid, s["id"]))
     central = len(index)
     for nb in _json_out(nlm(p, "list", "--json", timeout=90)).get("notebooks", []):
         if not str(nb.get("title") or "").startswith(LIB_PREFIX) or nb.get("is_owner") is False:

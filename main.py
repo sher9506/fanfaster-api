@@ -97,7 +97,8 @@ def _central_ids() -> List[str]:
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "central_lib_ids.txt")
     if not raw and os.path.exists(path):
         raw = open(path, encoding="utf-8").read()
-    return [x.strip() for x in raw.replace(",", "\n").splitlines() if x.strip() and not x.startswith("#")]
+    lines = [ln for ln in raw.splitlines() if not ln.strip().startswith("#")]   # izoh qatorlari tashlanadi
+    return [x.strip() for x in ",".join(lines).split(",") if x.strip()]
 
 
 CENTRAL_LIB_IDS = _central_ids()

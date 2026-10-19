@@ -89,6 +89,18 @@ HEAVY_ASK_SEM = threading.BoundedSemaphore(HEAVY_ASK_LIMIT)
 # Kutubxona xato bersa, avtomatik eski usulga (to'g'ridan-to'g'ri qo'shish) qaytadi. 0 yoki bo'sh = eski xulq.
 LIBRARY = os.environ.get("NLM_LIBRARY", "").strip() == "1"
 LIB_PREFIX = "LIB-"
+# Markaziy kutubxona: boshqa akkauntdagi, shu akkauntga VIEWER sifatida ulashilgan daftarlar (vergul bilan ID).
+# Faqat o'qiladi (nusxa olinadi); yangi hujjat avvalgidek o'z LIB- daftariga qo'shiladi.
+def _central_ids() -> List[str]:
+    """Env NLM_CENTRAL_LIB_IDS (vergul bilan) yoki repo'dagi central_lib_ids.txt (har qatorda bitta ID)."""
+    raw = os.environ.get("NLM_CENTRAL_LIB_IDS", "")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "central_lib_ids.txt")
+    if not raw and os.path.exists(path):
+        raw = open(path, encoding="utf-8").read()
+    return [x.strip() for x in raw.replace(",", "\n").splitlines() if x.strip() and not x.startswith("#")]
+
+
+CENTRAL_LIB_IDS = _central_ids()
 LIB_MAX_SOURCES = max(int(os.environ.get("NLM_LIB_MAX_SOURCES", "45")), 1)   # bitta kutubxona daftaridagi manbalar (bepul akkaunt 50 ta)
 LIB_WAIT_SEC = max(int(os.environ.get("NLM_LIB_WAIT_SEC", "360")), 60)       # yangi hujjat kutubxonada tayyor bo'lishini kutish
 POLL_SEC = max(float(os.environ.get("NLM_POLL_SEC", "3")), 1.0)             # manbalar tayyorligini tekshirish oralig'i
@@ -886,10 +898,19 @@ def lib_sources(p: str, nid: str) -> List[dict]:
 
 
 def lib_load(p: str) -> None:
-    """Akkauntdagi LIB- daftarlarini o'qib, indeksni quradi. LIB_LOCKS[p] ichida chaqiriladi."""
+    """Akkauntdagi LIB- daftarlarini va markaziy kutubxonani o'qib, indeksni quradi. LIB_LOCKS[p] ichida chaqiriladi."""
     if LIB_INDEX[p] is not None:
         return
     index, counts = {}, {}
+    # markaziy kutubxona birinchi: hujjat u yerda bo'lsa, o'z kutubxonasiga qayta yuklanmaydi
+    for nid in CENTRAL_LIB_IDS:
+        try:
+            for s in lib_sources(p, nid):
+                if s.get("status") == "ready" and s.get("url"):
+                    index.setdefault(lib_key(s["url"]), (nid, s["id"]))
+        except NlmError as e:   # ulashilmagan yoki o'chirilgan daftar ishni to'xtatmasin
+            print(f"[lib] {p}: markaziy daftar {nid[:8]} o'qilmadi: {str(e)[:120]}", flush=True)
+    central = len(index)
     for nb in _json_out(nlm(p, "list", "--json", timeout=90)).get("notebooks", []):
         if not str(nb.get("title") or "").startswith(LIB_PREFIX) or nb.get("is_owner") is False:
             continue
@@ -899,7 +920,7 @@ def lib_load(p: str) -> None:
             if s.get("status") == "ready" and s.get("url"):
                 index.setdefault(lib_key(s["url"]), (nb["id"], s["id"]))
     LIB_INDEX[p], LIB_COUNTS[p] = index, counts
-    print(f"[lib] {p}: {len(counts)} ta kutubxona daftari, {len(index)} ta hujjat", flush=True)
+    print(f"[lib] {p}: markaziy {central} ta hujjat, {len(counts)} ta o'z daftari, jami {len(index)} ta hujjat", flush=True)
 
 
 def lib_pick(p: str) -> str:

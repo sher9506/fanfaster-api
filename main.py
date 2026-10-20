@@ -22,8 +22,10 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -603,14 +605,111 @@ def looks_truncated(text: str) -> bool:
     return len(t) > 1500 and not any(w in _norm(t) for w in CONCLUSION_WORDS)
 
 
-def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Optional[str] = None) -> str:
+
+# ── [N] iqtiboslar -> lex.uz moddasiga havola (faqat so'rovda citations=True bo'lsa) ──
+# NotebookLM har [N] uchun manba (source_id) va iqtibos matnini beradi. Belgi "[217-modda](lex.uz/docs/ID#:~:text=...)"
+# havolasiga aylanadi: brauzer sahifani aynan shu gapga aylantirib, uni belgilab ochadi (text fragment).
+CITE_MARK_RE = re.compile(r"[ \t]*\[(\d+(?:\s*[-–,]\s*\d+)*)\]")
+CITE_HEAD_RE = re.compile(r"(\d+)[¹²³⁴⁵⁶⁷⁸⁹⁰]*-(?:модда|modda)\.", re.I)          # modda sarlavhasi ("217-модда.")
+CITE_NOISE_RE = re.compile(r"(?i)ҳужжатга таклиф юбориш|аудиони тинглаш|ҳужжат элементидан ҳавола олиш|"
+                           r"hujjatga taklif yuborish|audioni tinglash|hujjat elementidan havola olish|"
+                           r"lexuz шарҳи|lexuz sharhi|олдинги таҳрирга қаранг\.?|oldingi tahrirga qarang\.?")
+CITE_DOC_RE = re.compile(r"lex\.uz/(?:[a-z]{2}/)?docs/(-?\d+)")
+_CITE_FULLTEXT: "OrderedDict[str, str]" = OrderedDict()   # lex hujjat ID -> to'liq matn (oxirgi 12 tasi)
+
+
+def _cite_numbers(group: str) -> List[int]:
+    """"1, 3-5" -> [1, 3, 4, 5]"""
+    out: List[int] = []
+    for part in re.split(r"\s*,\s*", group.strip()):
+        m = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", part)
+        if m and 0 < int(m.group(2)) - int(m.group(1)) < 30:
+            out += list(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def _cite_fragment(clean: str) -> str:
+    """Iqtibosdan sahifada aynan topiladigan 4–7 so'zlik bo'lak (bloklar orasi bo'shliqsiz yopishgan so'zlar tashlanadi)."""
+    for run in re.findall(r"[^\W_]+(?: [^\W_]+){3,}", clean):
+        words = []
+        for w in run.split(" "):
+            if re.search(r"\d", w) and re.search(r"[^\W\d_]", w):   # "таътиллар408" — ikki blok yopishgan
+                break
+            words.append(w)
+        if len(words) >= 4:
+            return quote(" ".join(words[:7]), safe="").replace("-", "%2D")
+    return ""
+
+
+def _cite_article(fulltext: str, parts: List[str]) -> Optional[str]:
+    """Iqtibos bo'lagini to'liq matndan topib (oxirgi uchrashuv — mundarija emas, asosiy matn), undan oldingi modda sarlavhasi."""
+    for part in sorted(parts, key=len, reverse=True):
+        if len(part) < 25:
+            break
+        idx = fulltext.rfind(part[:120])
+        if idx >= 0:
+            heads = CITE_HEAD_RE.findall(fulltext[max(0, idx - 80000):idx + 15])
+            return heads[-1] if heads else None
+    return None
+
+
+async def link_citations(c, nid: str, r) -> str:
+    refs = [x for x in (getattr(r, "references", None) or []) if x.citation_number]
+    if not refs:
+        return r.answer
+    urls = {s.id: (s.url or "") for s in await c.sources.list(nid)}
+    links: dict = {}
+    for ref in refs:
+        m = CITE_DOC_RE.search(urls.get(ref.source_id, ""))
+        if not m:
+            continue
+        doc = m.group(1)
+        parts = [x.strip() for x in CITE_NOISE_RE.split(ref.cited_text or "") if x.strip()]
+        clean = re.sub(r"\s+", " ", " ".join(parts))
+        head = CITE_HEAD_RE.match(clean)
+        art = head.group(1) if head else None
+        if not art and parts:
+            if doc not in _CITE_FULLTEXT:
+                ft = await c.sources.get_fulltext(nid, ref.source_id)
+                _CITE_FULLTEXT[doc] = getattr(ft, "content", "") or ""
+                while len(_CITE_FULLTEXT) > 12:
+                    _CITE_FULLTEXT.popitem(last=False)
+            art = _cite_article(_CITE_FULLTEXT[doc], parts)
+        frag = _cite_fragment(clean)
+        links[ref.citation_number] = (f"{art}-modda" if art else "lex.uz",
+                                      f"https://lex.uz/docs/{doc}" + (f"#:~:text={frag}" if frag else ""))
+
+    def repl(mm):
+        out, seen = [], set()
+        for n in _cite_numbers(mm.group(1)):
+            label, href = links.get(n, (None, None))
+            if label and label not in seen:
+                seen.add(label)
+                out.append(f"[{label}]({href})")
+        return (" " + ", ".join(out)) if out else ""
+    return CITE_MARK_RE.sub(repl, r.answer)
+
+
+def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Optional[str] = None,
+             cite: bool = False) -> str:
     """Bitta `ask` chaqiruvi. Timeout/DEADLINE_EXCEEDED bo'lsa AskStalled ko'taradi (with_retry savolni qayta yubormaydi)."""
     args = ["ask", "--notebook", nid] + (["-c", conv_id] if conv_id else []) + [prompt]
     try:
         if PY_API:
-            r = api(p, lambda c: c.chat.ask(nid, prompt, conversation_id=conv_id), backend=backend, timeout=ASK_TIMEOUT)
+            async def op(c):
+                res = await c.chat.ask(nid, prompt, conversation_id=conv_id)
+                text = res.answer
+                if cite:
+                    try:
+                        text = await link_citations(c, nid, res)
+                    except Exception as e:   # noqa: BLE001 -- havolasiz javob ham to'liq javob
+                        print(f"[cite] {p}: havolalar yasalmadi: {str(e)[:200]}", flush=True)
+                return res, text
+            r, answer = api(p, op, backend=backend, timeout=ASK_TIMEOUT)
             # "Conversation: <id>" qatori clean_answer'da tashlanadi, suhbat ID'si esa run_job'da shu qatordan olinadi
-            return f"{r.answer}\nConversation: {r.conversation_id}" if r.conversation_id else r.answer
+            return f"{answer}\nConversation: {r.conversation_id}" if r.conversation_id else answer
         return nlm(p, *args, timeout=ASK_TIMEOUT, backend=backend)
     except AuthError:
         raise
@@ -620,7 +719,7 @@ def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Opt
         raise
 
 
-def ask_custom(p: str, nid: str, prompt: str, step, conv_id: Optional[str] = None) -> str:
+def ask_custom(p: str, nid: str, prompt: str, step, conv_id: Optional[str] = None, cite: bool = False) -> str:
     """Vaqtinchalik (manbali) daftarga savol. Javob hajmi oshib ketsa, bir marta android backend bilan qayta urinadi.
     Timeout bo'lsa AskStalled ko'tariladi: chaqiruvchi uni HEAVY_ASK_SEM TASHQARISIDA recover_answer bilan hal qiladi."""
     backends = [CUSTOM_ASK_BACKEND or None]
@@ -629,7 +728,7 @@ def ask_custom(p: str, nid: str, prompt: str, step, conv_id: Optional[str] = Non
     last: Optional[Exception] = None
     for be in backends:
         try:
-            return with_retry(lambda: _ask_cmd(p, nid, prompt, be, conv_id))
+            return with_retry(lambda: _ask_cmd(p, nid, prompt, be, conv_id, cite))
         except AuthError:
             raise
         except AskStalled:
@@ -1225,7 +1324,8 @@ def run_job(job: dict, acc: dict) -> dict:
                 step("savol navbatdan o'tdi")
                 with MemWatch(f"job={jid}"):
                     try:
-                        raw = ask_custom(p, nid, prompt, step, conv_id=req.conversation_id if reuse else None)
+                        raw = ask_custom(p, nid, prompt, step, conv_id=req.conversation_id if reuse else None,
+                                         cite=req.citations)
                     except AskStalled as e:
                         if not HISTORY_RECOVERY:
                             raise
@@ -1378,6 +1478,7 @@ class KazusRequest(BaseModel):
     profile: Optional[str] = Field(default=None, max_length=64)          # daftar egasi akkaunt profili
     conversation_id: Optional[str] = Field(default=None, max_length=128)
     prior_turns: int = Field(default=0, ge=0, le=50)
+    citations: bool = False                                              # [N] -> lex.uz moddasiga havola (sinov: faqat preview)
 
     @model_validator(mode="after")
     def _check_chat(self):

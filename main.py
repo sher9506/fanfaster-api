@@ -859,7 +859,7 @@ def _part_positions(flat: str, num: str, sup: Optional[str], parts: list) -> tup
     end = nxt.start() if nxt else len(flat)
     flat_ap, out, at = _AP_RE.sub("'", flat), [], h.end()
     for q, (qf, bands) in enumerate(parts, 1):
-        for b, words in [(0, qf)] + [(n, re.sub(r"^\d{1,2}\)\s*", "", bf or "")) for n, bf in bands]:
+        for b, words in [(0, _frag_start(qf))] + [(n, re.sub(r"^\d{1,2}\)\s*", "", _frag_start(bf))) for n, bf in bands]:
             if not words:
                 continue
             m = _words_re(words).search(flat_ap, at, end)
@@ -867,6 +867,16 @@ def _part_positions(flat: str, num: str, sup: Optional[str], parts: list) -> tup
                 out.append((m.start(), q, b))
                 at = m.start() + 1
     return h.start(), end, out
+
+
+def _frag_start(f) -> str:
+    """Jadval bo'lagi: "so'zlar" yoki takrorlanuvchi qisqa qism uchun ["boshi", "keyingi qator boshi"]."""
+    return (f[0] if isinstance(f, list) else f) or ""
+
+
+def _frag_url(f) -> str:
+    q = lambda t: quote(t, safe="").replace("-", "%2D")
+    return f"{q(f[0])},-{q(f[1])}" if isinstance(f, list) else q(f)
 
 
 def _part_fix(phrase: str, pm, q: Optional[int], b: Optional[int]) -> str:
@@ -1006,7 +1016,7 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
         target = frag(*fix) if fix else frag(q, b)
         if not target:
             return None, None
-        return f"https://lex.uz/docs/{doc}#:~:text={quote(target, safe='').replace('-', '%2D')}", fix
+        return f"https://lex.uz/docs/{doc}#:~:text={_frag_url(target)}", fix
 
     async def band_url(law, num: str, ctx: str, single: bool) -> tuple:
         """(havola, to'g'ri band raqami yoki None). Bot keltirgan gap boshqa bandda bo'lsa (raqamni adashtirgan) — o'sha band."""

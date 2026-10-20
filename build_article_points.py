@@ -76,13 +76,20 @@ class Locator:
                 return j == limit
             start = j + 1
 
-    def frag(self, idx, text):
+    def frag(self, idx, text, nxt=""):
         words = text.split()
         lo = min(KMIN, len(words))
         for k in range(lo, min(KMAX, len(words)) + 1):
             cand = " ".join(words[:k])
             if self.first_hit(cand.lower(), self.offsets[idx]):
                 return cand
+        # takrorlanuvchi qisqa qism ("Фирибгарлик:" JK 168 ning 2-, 3-, 4-qismlarida): brauzer suffiksi —
+        # "#:~:text=boshi,-keyingi qator boshi" (keyingi blok bilan birga noyob bo'lsa)
+        nw = nxt.split()
+        if len(words) <= KMAX:
+            for k in range(1, min(10, len(nw)) + 1):
+                if self.first_hit((text + " " + " ".join(nw[:k])).lower(), self.offsets[idx]):
+                    return [text, " ".join(nw[:k])]
         return None
 
 
@@ -90,6 +97,7 @@ def build(page):
     items = list(blocks(page))
     loc = Locator([t for _, t, _ in items])
     res, cur = {}, None
+    nxt = lambda i: next((t2 for _, t2, _ in items[i + 1:i + 6] if t2.strip()), "")
     for idx, (cls, t, raw) in enumerate(items):
         key = article_key(raw) if cls != "ACT_TEXT" or ARTICLE.match(t) else None
         if key:
@@ -107,11 +115,11 @@ def build(page):
         if m:
             if not cur:
                 cur.append([None, []])
-            cur[-1][1].append([int(m.group(1)), loc.frag(idx, t)])
+            cur[-1][1].append([int(m.group(1)), loc.frag(idx, t, nxt(idx))])
         elif re.match(r"^[a-zа-яёўқғҳ]\)", t, re.I) or starts_lower(t):
             continue  # letter sub-point / unnumbered paragraph (хатбоши) continuing the current part
         else:
-            cur.append([loc.frag(idx, t), []])
+            cur.append([loc.frag(idx, t, nxt(idx)), []])
     return res
 
 

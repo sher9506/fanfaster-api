@@ -765,14 +765,48 @@ def _mention_items(nums: str) -> list:
     return items
 
 
-def _band_fragment(after: str, flat: str) -> str:
-    """Plenum bandi: NotebookLM matnida band raqamlari yo'q, shuning uchun javobda banddan keyin kelgan gapdagi 6+ so'z
-    Plenum matnida aynan uchrasa — o'sha joyga bo'lak; uchramasa bo'sh (havola Plenumning o'zini ochadi)."""
-    flat_ap = re.sub(r"[ʻʼ‘’`´]", "'", flat)   # uzunlik o'zgarmaydi — indeks flat bilan bir xil
-    sent = re.split(r"(?<=[.;:!?])\s", re.sub(r"[ʻʼ‘’`´]", "'", after.lower()), maxsplit=1)[0][:400]
-    for run in re.findall(r"[^\W_]+(?:'[^\W_]+)*(?: [^\W_]+(?:'[^\W_]+)*){5,}", sent):
+# Plenum bandlari: NotebookLM matnida "62." kabi band raqamlari yo'q (bot raqamni taxmin qiladi), shuning uchun raqam -> band
+# boshidagi so'zlar jadvali lex.uz sahifalaridan yig'ilgan: {doc: [[62, "Mehnat shartnomasi qonunga xilof ..."], ...]}.
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "plenum_points.json"), encoding="utf-8") as _f:
+        PLENUM_POINTS = json.load(_f)
+except (OSError, ValueError) as _e:
+    PLENUM_POINTS = {}
+    print(f"[cite] plenum_points.json o'qilmadi, Plenum band raqamlari tekshirilmaydi: {_e}", flush=True)
+_PLENUM_POS: dict = {}   # doc -> [(to'liq matndagi joy, band raqami)] — kichik, hujjatga bir marta
+_AP_RE = re.compile(r"[ʻʼ‘’`´]")
+MD_LINK_LABEL_RE = re.compile(r"\[([^\]\n]*)\]\([^)\s]*\)")
+
+
+def _plenum_positions(doc: str, flat: str) -> list:
+    """Jadvaldagi har band boshi to'liq matnning qayerida (ketma-ket qidiriladi; topilmagan band tashlab ketiladi)."""
+    if doc not in _PLENUM_POS:
+        flat_ap, out, at = _AP_RE.sub("'", flat), [], 0
+        for n, words in PLENUM_POINTS.get(doc, []):
+            # NotebookLM matnida havoladan keyin manzili turadi ("914-moddasiga http://lex.uz/docs/… muvofiq") — so'zlar orasida o'tkazamiz
+            pat = r"\s(?:https?://\S+\s)?".join(map(re.escape, _AP_RE.sub("'", words.lower()).split()))
+            h = re.compile(pat).search(flat_ap, at)
+            if h:
+                out.append((h.start(), n))
+                at = h.start() + 1
+        _PLENUM_POS[doc] = out
+    return _PLENUM_POS[doc]
+
+
+def _point_fragment(doc: str, n: int) -> str:
+    """Band boshiga bo'lak: lex.uz'da band "62. Mehnat shartnomasi …" deb boshlanadi."""
+    words = next((w for k, w in PLENUM_POINTS.get(doc, []) if k == n), None)
+    return quote(f"{n}. " + " ".join(words.split()[:6]), safe="").replace("-", "%2D") if words else ""
+
+
+def _band_match(ctx: str, flat: str) -> tuple:
+    """Javobdagi band haqidagi gapning 6–10 so'zi Plenum matnida aynan (butun so'zlar bilan) uchragan joy:
+    (bo'lak matni, joyi) yoki ("", -1). Brauzer bo'lakni faqat butun so'zlar bilan topadi ("kechgan" ≠ "kechganda")."""
+    flat_ap = _AP_RE.sub("'", flat)   # uzunlik o'zgarmaydi — indeks flat bilan bir xil
+    for run in re.findall(r"[^\W_]+(?:'[^\W_]+)*(?: [^\W_]+(?:'[^\W_]+)*){5,}", _AP_RE.sub("'", ctx.lower())[:400]):
         words = run.split(" ")
-        def at(n: int, i: int) -> int:   # brauzer bo'lakni faqat butun so'zlar bilan topadi ("kechgan" ≠ "kechganda")
+
+        def at(n: int, i: int) -> int:
             h = re.search(r"(?<!\w)" + re.escape(" ".join(words[i:i + n])) + r"(?!\w)", flat_ap)
             return h.start() if h else -1
         for i in range(len(words) - 5):
@@ -781,9 +815,18 @@ def _band_fragment(after: str, flat: str) -> str:
                 n = 6
                 while i + n < len(words) and n < 10 and at(n + 1, i) == j:
                     n += 1
-                frag = flat[j:j + len(" ".join(words[i:i + n]))]
-                return quote(frag, safe="").replace("-", "%2D")
-    return ""
+                return flat[j:j + len(" ".join(words[i:i + n]))], j
+    return "", -1
+
+
+def _band_context(para: str, a: int, b: int) -> str:
+    """Band eslatmasi haqidagi gap: eslatmadan keyingi qism (keyingi band eslatmasigacha), u qisqa bo'lsa — oldingi qism."""
+    after = re.split(r"(?<=[.!?])\s|\n", MD_LINK_LABEL_RE.sub(r"\1", para[b:]), maxsplit=1)[0]
+    after = re.split(r"\d+-band", after, maxsplit=1)[0]
+    if len(after.split()) >= 6:
+        return after
+    before = re.split(r"(?<=[.!?])\s|\n", MD_LINK_LABEL_RE.sub(r"\1", para[:a]))[-1]
+    return re.split(r"\d+-band\w*", before)[-1]
 
 
 async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
@@ -842,7 +885,8 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, words[doc])[0]}"
         return None
 
-    async def band_url(law, after: str) -> Optional[str]:
+    async def band_url(law, num: str, ctx: str, single: bool) -> tuple:
+        """(havola, to'g'ri band raqami yoki None). Bot keltirgan gap boshqa bandda bo'lsa (raqamni adashtirgan) — o'sha band."""
         for doc, sid, title, _, _ in docs:
             if law[0] == "doc" and doc != law[1]:
                 continue
@@ -851,13 +895,25 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 if not m or m.group(1) != str(int(law[1])) or (law[2] and f".{law[2]}." not in title):
                     continue
             elif law[0] != "doc":
-                return None
+                return None, None
             flat = await flat_of(doc, sid)
             if not _cite_doc_label(title, flat).startswith("Plenum"):
                 continue
-            frag = _band_fragment(after, flat)
-            return f"https://lex.uz/docs/{doc}" + (f"#:~:text={frag}" if frag else "")
-        return None
+            base, n = f"https://lex.uz/docs/{doc}", int(num)
+            own = _point_fragment(doc, n)
+            text, j = _band_match(ctx, flat)
+            if j < 0:
+                return base + (f"#:~:text={own}" if own else ""), None
+            pos = _plenum_positions(doc, flat)
+            starts = [p for p, k in pos if k == n]
+            if starts:   # gap botning o'zi aytgan bandida ham bor bo'lsa — raqam to'g'ri, havola band boshiga
+                end = next((p for p, _ in pos if p > starts[0]), len(flat))
+                if flat.find(text, starts[0], end) >= 0:
+                    return base + f"#:~:text={own}", None
+            real = next((k for p, k in reversed(pos) if p <= j), None)
+            frag = quote(text, safe="").replace("-", "%2D")
+            return base + f"#:~:text={frag}", (real if single and real is not None and real != n else None)
+        return None, None
 
     out = []
     for para in re.split(r"(\n\s*\n)", text):
@@ -889,7 +945,12 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                     tok = nums[s:e] + (tail if last else "")
                     if tok.isdigit():   # "[87](…)" ni edge funksiyalar NotebookLM'ning "[87]" belgisi deb o'chiradi — ko'rinmas U+2060
                         tok += "\u2060"
-                    u = await (band_url(law, seg[m.end():]) if is_band else article_url(law, num, sup))
+                    if is_band:
+                        u, fixed = await band_url(law, num, _band_context(para, pos + m.start(), pos + m.end()), len(items) == 1)
+                        if fixed:   # bot band raqamini adashtirgan: keltirgan gapi aslida boshqa bandda
+                            tok = str(fixed) + tok[len(num):]
+                    else:
+                        u = await article_url(law, num, sup)
                     rendered.append(nums[at:s] + (f"[{tok}]({u})" if u and len(tok) <= 40 else tok))
                     at = e
                 res.append(seg[k:m.start()] + "".join(rendered))

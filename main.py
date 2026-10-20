@@ -887,6 +887,8 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 for n, (s, e, num, sup) in enumerate(items):
                     last = n == len(items) - 1
                     tok = nums[s:e] + (tail if last else "")
+                    if tok.isdigit():   # "[87](…)" ni edge funksiyalar NotebookLM'ning "[87]" belgisi deb o'chiradi — ko'rinmas U+2060
+                        tok += "\u2060"
                     u = await (band_url(law, seg[m.end():]) if is_band else article_url(law, num, sup))
                     rendered.append(nums[at:s] + (f"[{tok}]({u})" if u and len(tok) <= 40 else tok))
                     at = e

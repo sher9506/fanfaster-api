@@ -733,7 +733,7 @@ LAW_NAME_TAIL_RE = re.compile(r"\s*(?:gi\s+)?(?:qonun|kodeks|farmon|qaror|nizom)
 PLENUM_REF_RE = re.compile(r"plenum\w*\s+(?:(\d{4})-yil\s+)?(?:\S+\s+){0,4}?(\d+)-son\w*(?:\s+qaror\w*)?"
                            r"|(\d+)-son\w*\s+(?:\S+\s+){0,3}?plenum\w*(?:\s+qaror\w*)?")
 UNSUP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
-MENTION_RE = re.compile(r"(?<![\d.])((?:\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*(?:\s*,\s*|\s+va\s+|\s+hamda\s+|\s*[–—]\s*|-))*\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*)"
+MENTION_RE = re.compile(r"(?<!\d)(?<!\d\.)((?:\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*(?:\s*,\s*|\s+va\s+|\s+hamda\s+|\s*[–—]\s*|-))*\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*)"
                         r"((?:-|\s)(?:modda|модда|band|банд)\w*)", re.I)
 MD_LINK_RE = re.compile(r"\[[^\]\n]{1,60}\]\(https://lex\.uz/[^)\s]+\)")
 
@@ -859,20 +859,27 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
 
     out = []
     for para in re.split(r"(\n\s*\n)", text):
-        prev = None
+        prev_art = prev_band = None   # moddalar va Plenum bandlari uchun oxirgi hujjat alohida
         pieces, pos = [], 0
         for link in list(MD_LINK_RE.finditer(para)) + [None]:   # mavjud havolalar ichiga tegmaymiz
             seg = para[pos:link.start()] if link else para[pos:]
             res, k = [], 0
             for m in MENTION_RE.finditer(seg):
-                law = resolve(_law_norm(seg[max(0, m.start() - 200):m.start()]))
-                if law is None or law[0] == "same":
-                    law = prev
-                prev = law
-                if not law or law[0] == "other":
-                    continue
+                before = re.sub(r"\[([^\]\n]*)\]\([^)\s]*\)", r"\1", para[:pos] + seg[:m.start()])[-200:]
+                ctx = _law_norm(before)
+                found = resolve(ctx)
                 nums, tail = m.group(1), m.group(2)
                 is_band = re.match(r"(?:-|\s)(?:band|банд)", tail, re.I) is not None
+                if is_band:
+                    if re.search(r"(?:modda|qism)\w*[\s,]*(?:\S+\s+){0,3}$", ctx):   # "547-moddasi birinchi qismi 1-bandi"
+                        continue
+                    law = found if found and found[0] in ("plenum", "doc") else prev_band
+                    prev_band = law
+                else:
+                    law = prev_art if found is None or found[0] == "same" else found
+                    prev_art = law
+                if not law or law[0] == "other":
+                    continue
                 items = _mention_items(nums)
                 rendered, at = [], 0
                 for n, (s, e, num, sup) in enumerate(items):

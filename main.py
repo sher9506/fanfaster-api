@@ -701,27 +701,40 @@ def _lat(s: str) -> str:
     return "".join(_CYR_LAT.get(ch, ch) for ch in s)
 
 
-# Javobda tilga olingan qonun -> manba sarlavhasi qolipi (aniqrog'i oldin: protsessual kodekslar oddiylardan oldin)
+# Javobda tilga olingan kodeks -> kodeks sarlavhasining OXIRI ("...Жиноят кодекси"); "...kodeksiga o'zgartish..." qonunlari
+# shu bilan chiqib ketadi. Qolgan qonun/farmon/Plenumlar nomi bo'yicha (LAW_NAME) yoki raqami bo'yicha (PLENUM_REF_RE) topiladi.
 MENTION_LAWS = [
-    (r"fuqaro(?:lik)?\s+protsessual|\bfpk\b", r"fuqarolik protsessual"),
-    (r"jinoyat[- ]protsessual|\bjpk\b", r"jinoyat-protsessual"),
-    (r"ma'muriy\s+javobgarlik|\bmjtk\b", r"ma'muriy javobgarlik"),
-    (r"jinoyat[- ]ijroiya", r"jinoyat-ijroiya"),
-    (r"iqtisodiy\s+protsessual|\bipk\b", r"iqtisodiy protsessual"),
-    (r"fuqaro(?:lik)?\s+kodeks|\bfk\b", r"fuqarolik kodeksi"),
-    (r"jinoyat\s+kodeks|\bjk\b", r"jinoyat kodeksi"),
-    (r"mehnat\s+kodeks|\bmk\b", r"mehnat kodeksi"),
+    (r"fuqaro(?:lik)?\s+protsessual|\bfpk(?:ning|ga|da|ni|dan|dagi)?\b", r"fuqarolik protsessual kodeksi"),
+    (r"jinoyat[- ]protsessual|\bjpk(?:ning|ga|da|ni|dan|dagi)?\b", r"jinoyat-protsessual kodeksi"),
+    (r"ma'muriy\s+javobgarlik|\bmjtk(?:ning|ga|da|ni|dan|dagi)?\b", r"ma'muriy javobgarlik to'g'risidagi kodeksi"),
+    (r"ma'muriy\s+sud\s+ishlarini|\bmsiyuk(?:ning|ga|da|ni|dan|dagi)?\b", r"ma'muriy sud ishlarini yuritish to'g'risidagi kodeksi"),
+    (r"jinoyat[- ]ijroiya|\bjik(?:ning|ga|da|ni|dan|dagi)?\b", r"jinoyat-ijroiya kodeksi"),
+    (r"iqtisodiy\s+protsessual|\bipk(?:ning|ga|da|ni|dan|dagi)?\b", r"iqtisodiy protsessual kodeksi"),
+    (r"fuqaro(?:lik)?\s+kodeks|\bfk(?:ning|ga|da|ni|dan|dagi)?\b", r"fuqarolik kodeksi"),
+    (r"jinoyat\s+kodeks|\bjk(?:ning|ga|da|ni|dan|dagi)?\b", r"jinoyat kodeksi"),
+    (r"mehnat\s+kodeks|\bmk(?:ning|ga|da|ni|dan|dagi)?\b", r"mehnat kodeksi"),
     (r"oila\s+kodeks", r"oila kodeksi"),
     (r"uy-joy\s+kodeks", r"uy-joy kodeksi"),
     (r"soliq\s+kodeks", r"soliq kodeksi"),
     (r"yer\s+kodeks", r"yer kodeksi"),
     (r"bojxona\s+kodeks", r"bojxona kodeksi"),
     (r"shaharsozlik\s+kodeks", r"shaharsozlik kodeksi"),
-    (r"konstitutsiya(?!viy)", r"respublikasi konstitutsiyasi\s*$"),   # o'zgartish qonunlari emas, Konstitutsiyaning o'zi
-    # ro'yxatda yo'q boshqa hujjat ("...to'g'risida"gi Qonunning 13-moddasi") — havola qo'yilmaydi, oldingi qonun ham olinmaydi
-    (r"[\"“”»]\s*gi\s+(?:qonun|farmon|qaror|nizom)|\b(?:qonun|farmon|qaror|nizom)(?:i|ning|iga|ida)\b", None),
+    (r"havo\s+kodeks", r"havo kodeksi"),
+    (r"saylov\s+kodeks", r"saylov kodeksi"),
+    (r"b(?:yu|u)djet\s+kodeks", r"byudjet kodeksi"),
+    (r"suv\s+kodeks", r"suv kodeksi"),
+    (r"konstitutsiya(?!viy)", r"respublikasi konstitutsiyasi"),
 ]
-MENTION_RE = re.compile(r"((?:\d+(?:-\d{1,2})?(?:\s*,\s*|\s+va\s+|\s+hamda\s+))*)(\d+)(?:-(\d{1,2}))?(-(?:modda|модда)\w*)", re.I)
+# daftarda yo'q hujjat ("...to'g'risida"gi Qonunning 13-moddasi") — havola qo'yilmaydi, oldingi qonun ham olinmaydi
+MENTION_OTHER_RE = re.compile(r"\bgi\s+(?:qonun|farmon|qaror|nizom)\w*|to'g'risida\s+(?:qonun|farmon|qaror|nizom)\w*"
+                              r"|\b(?:qonun|farmon|qaror|nizom)(?:i|ning|iga|ida|da)\b")
+MENTION_SAME_RE = re.compile(r"\b(?:shu|ushbu|mazkur)\s+(?:qonun|kodeks|qaror|farmon)\w*")   # "shu qonunning" — oldingisi
+LAW_NAME_TAIL_RE = re.compile(r"\s*(?:gi\s+)?(?:qonun|kodeks|farmon|qaror|nizom)\w*")
+PLENUM_REF_RE = re.compile(r"plenum\w*\s+(?:(\d{4})-yil\s+)?(?:\S+\s+){0,4}?(\d+)-son\w*(?:\s+qaror\w*)?"
+                           r"|(\d+)-son\w*\s+(?:\S+\s+){0,3}?plenum\w*(?:\s+qaror\w*)?")
+UNSUP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+MENTION_RE = re.compile(r"(?<![\d.])((?:\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*(?:\s*,\s*|\s+va\s+|\s+hamda\s+|\s*[–—]\s*|-))*\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*)"
+                        r"((?:-|\s)(?:modda|модда|band|банд)\w*)", re.I)
 MD_LINK_RE = re.compile(r"\[[^\]\n]{1,60}\]\(https://lex\.uz/[^)\s]+\)")
 
 
@@ -730,15 +743,60 @@ def _has_article(flat: str, num: str, sup: Optional[str]) -> bool:
     return re.search(pat, flat) is not None
 
 
+def _law_norm(s: str) -> str:
+    """Nomlarni solishtirish uchun: lotin, kichik harf, qo'shtirnoqsiz, "to'g'risidagi" -> "to'g'risida"."""
+    s = re.sub(r"[“”\"«»„]", " ", _lat(s))
+    s = re.sub(r"\b(to'g'risida|haqida)\s*gi\b", r"\1", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _mention_items(nums: str) -> list:
+    """"79, 80 va 81" / "582–586" / "66-1" / "66¹" -> [(start, end, num, sup)]. "N-M" da M kichik (≤2 raqam) bo'lsa — 66¹
+    kabi yuqori indeks, katta bo'lsa — diapazon (582-586)."""
+    items = []
+    for m in re.finditer(r"(\d+)([⁰¹²³⁴⁵⁶⁷⁸⁹]*)", nums):
+        num, sup = m.group(1), m.group(2).translate(UNSUP) or None
+        if (items and not sup and not items[-1][3] and nums[items[-1][1]:m.start()] == "-"
+                and len(num) <= 2 and int(num) < int(items[-1][2])):
+            s, _, n, _ = items.pop()
+            items.append((s, m.end(), n, num))
+            continue
+        items.append((m.start(), m.end(), num, sup))
+    return items
+
+
+def _band_fragment(after: str, flat: str) -> str:
+    """Plenum bandi: NotebookLM matnida band raqamlari yo'q, shuning uchun javobda banddan keyin kelgan gapdagi 6+ so'z
+    Plenum matnida aynan uchrasa — o'sha joyga bo'lak; uchramasa bo'sh (havola Plenumning o'zini ochadi)."""
+    flat_ap = re.sub(r"[ʻʼ‘’`´]", "'", flat)   # uzunlik o'zgarmaydi — indeks flat bilan bir xil
+    sent = re.split(r"(?<=[.;:!?])\s", re.sub(r"[ʻʼ‘’`´]", "'", after.lower()), maxsplit=1)[0][:400]
+    for run in re.findall(r"[^\W_]+(?:'[^\W_]+)*(?: [^\W_]+(?:'[^\W_]+)*){5,}", sent):
+        words = run.split(" ")
+        for i in range(len(words) - 5):
+            frag = " ".join(words[i:i + 6])
+            j = flat_ap.find(frag)
+            if j >= 0:
+                n = 6
+                while i + n < len(words) and n < 10 and flat_ap.find(" ".join(words[i:i + n + 1])) == j:
+                    n += 1
+                frag = flat[j:j + len(" ".join(words[i:i + n]))]
+                return quote(frag, safe="").replace("-", "%2D")
+    return ""
+
+
 async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
-    """Javob matnidagi "Fuqarolik kodeksining 1153-moddasiga", "79 va 116-moddalariga", "47-4-moddasiga" kabi eslatmalarni
-    lex.uz moddasiga havola qiladi. Qonun nomi oldingi 90 belgidan (bo'lmasa xuddi shu abzatsdagi oldingi eslatmadan)
-    olinadi; modda daftardagi o'sha qonun manbasida borligi to'liq matndan tekshiriladi (FK 1-/2-qismi shu bilan ajraladi)."""
+    """Javob matnidagi "Fuqarolik kodeksining 1153-moddasiga", "79 va 116-moddalariga", "582–586-moddalari", "66¹-moddasi",
+    "“Iste'molchilarning huquqlarini himoya qilish to'g'risida”gi Qonunning 15-moddasi", "Plenumining 17-sonli qarorining
+    16-bandiga" kabi eslatmalarni lex.uz'dagi o'sha joyga havola qiladi. Hujjat oldingi 200 belgidagi eng yaqin nomdan
+    (bo'lmasa shu abzatsdagi oldingi eslatmadan) olinadi; modda o'sha manbada borligi to'liq matndan tekshiriladi."""
     docs = []
     for s in srcs.values():
         m = CITE_DOC_RE.search(s.url or "")
         if m:
-            docs.append((m.group(1), s.id, _lat(getattr(s, "title", "") or "")))
+            title = _lat(getattr(s, "title", "") or "")
+            stitle = re.sub(r"^\s*(?:\S+-son\s+)?\d\d\.\d\d\.\d{4}\.\s*", "", title)
+            name = re.sub(r"^o'zbekiston respublikasi(?:ning)?\s+", "", _law_norm(stitle))
+            docs.append((m.group(1), s.id, title, stitle, name))
 
     async def flat_of(doc: str, sid: str) -> str:
         if doc not in _CITE_FULLTEXT:
@@ -748,40 +806,81 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 _CITE_FULLTEXT.popitem(last=False)
         return _CITE_FULLTEXT[doc]
 
-    async def url_for(law_title: str, num: str, sup: Optional[str]) -> Optional[str]:
-        for doc, sid, title in docs:
-            if re.search(law_title, title) and _has_article(await flat_of(doc, sid), num, sup):
-                return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, _art_word(await flat_of(doc, sid)))[0]}"
+    def resolve(ctx: str):
+        """Eng yaqin (oxiri eslatmaga eng yaqin) hujjat nomi: ("law", qolip) | ("doc", doc, sid) | ("plenum", raqam, yil)
+        | ("other",) | ("same",) | None."""
+        cands = []
+        for pat, title_pat in MENTION_LAWS:
+            cands += [(h.end(), 2, ("law", title_pat)) for h in re.finditer(pat, ctx)]
+        for doc, sid, _, stitle, name in docs:
+            if len(name) >= 15 and stitle[:1] not in "“\"«":   # “…”gi Qonunga o'zgartish — o'zgartish qonunlari emas
+                for h in re.finditer(re.escape(name), ctx):
+                    t = LAW_NAME_TAIL_RE.match(ctx, h.end())
+                    cands.append((t.end() if t else h.end(), 2, ("doc", doc, sid)))
+        for h in PLENUM_REF_RE.finditer(ctx):
+            cands.append((h.end(), 2, ("plenum", h.group(2) or h.group(3), h.group(1))))
+        cands += [(h.end(), 1, ("same",)) for h in MENTION_SAME_RE.finditer(ctx)]
+        cands += [(h.end(), 0, ("other",)) for h in MENTION_OTHER_RE.finditer(ctx)]
+        return max(cands)[2] if cands else None
+
+    words = {}
+
+    async def article_url(law, num: str, sup: Optional[str]) -> Optional[str]:
+        for doc, sid, _, stitle, _ in docs:
+            if law[0] == "law" and not re.search(law[1] + r"(?: \([^)]*\))?\s*$", stitle):
+                continue
+            if law[0] == "doc" and doc != law[1]:
+                continue
+            if law[0] not in ("law", "doc"):
+                return None
+            flat = await flat_of(doc, sid)
+            if _has_article(flat, num, sup):
+                if doc not in words:   # yozuvni hujjatga bir marta aniqlaymiz (1,4 MB matnni har eslatmada qayta sanamaslik uchun)
+                    words[doc] = _art_word(flat)
+                return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, words[doc])[0]}"
         return None
 
-    out, last = [], 0
+    async def band_url(law, after: str) -> Optional[str]:
+        for doc, sid, title, _, _ in docs:
+            if law[0] == "doc" and doc != law[1]:
+                continue
+            if law[0] == "plenum":
+                m = re.match(r"\s*0*(\d+)-son\b", title)
+                if not m or m.group(1) != str(int(law[1])) or (law[2] and f".{law[2]}." not in title):
+                    continue
+            elif law[0] != "doc":
+                return None
+            flat = await flat_of(doc, sid)
+            if not _cite_doc_label(title, flat).startswith("Plenum"):
+                continue
+            frag = _band_fragment(after, flat)
+            return f"https://lex.uz/docs/{doc}" + (f"#:~:text={frag}" if frag else "")
+        return None
+
+    out = []
     for para in re.split(r"(\n\s*\n)", text):
-        prev_law = None
+        prev = None
         pieces, pos = [], 0
         for link in list(MD_LINK_RE.finditer(para)) + [None]:   # mavjud havolalar ichiga tegmaymiz
             seg = para[pos:link.start()] if link else para[pos:]
             res, k = [], 0
             for m in MENTION_RE.finditer(seg):
-                ctx = _lat(seg[max(0, m.start() - 90):m.start()])
-                best = None
-                for pat, title_pat in MENTION_LAWS:
-                    for h in re.finditer(pat, ctx):
-                        if not best or h.start() > best[0]:
-                            best = (h.start(), title_pat)
-                law = best[1] if best else prev_law   # best[1] None: ro'yxatda yo'q hujjat
-                prev_law = law
-                if not law:
+                law = resolve(_law_norm(seg[max(0, m.start() - 200):m.start()]))
+                if law is None or law[0] == "same":
+                    law = prev
+                prev = law
+                if not law or law[0] == "other":
                     continue
-                items = re.findall(r"(\d+)(?:-(\d{1,2}))?(\s*,\s*|\s+va\s+|\s+hamda\s+)", m.group(1))
-                rendered = []
-                for num, sup, sep in items:
-                    u = await url_for(law, num, sup or None)
-                    tok = f"{num}-{sup}" if sup else num
-                    rendered.append((f"[{tok}]({u})" if u else tok) + sep)
-                num, sup, tail = m.group(2), m.group(3), m.group(4)
-                u = await url_for(law, num, sup)
-                tok = f"{num}-{sup}{tail}" if sup else f"{num}{tail}"
-                rendered.append(f"[{tok}]({u})" if u and len(tok) <= 40 else tok)
+                nums, tail = m.group(1), m.group(2)
+                is_band = re.match(r"(?:-|\s)(?:band|банд)", tail, re.I) is not None
+                items = _mention_items(nums)
+                rendered, at = [], 0
+                for n, (s, e, num, sup) in enumerate(items):
+                    last = n == len(items) - 1
+                    tok = nums[s:e] + (tail if last else "")
+                    u = await (band_url(law, seg[m.end():]) if is_band else article_url(law, num, sup))
+                    rendered.append(nums[at:s] + (f"[{tok}]({u})" if u and len(tok) <= 40 else tok))
+                    at = e
                 res.append(seg[k:m.start()] + "".join(rendered))
                 k = m.end()
             pieces.append("".join(res) + seg[k:])
@@ -817,7 +916,7 @@ async def link_citations(c, nid: str, r) -> str:
     forced: dict = {}
     art_of: dict = {}   # [N] -> (hujjat, (modda, indeks)) — gapdagi eslatma bilan solishtirish uchun
     # javobda tilga olingan moddalar: {("47", "4"), ("122", "")}
-    mentioned = {(m.group(2), m.group(3) or "") for m in MENTION_RE.finditer(r.answer or "")}
+    mentioned = {(num, sup or "") for m in MENTION_RE.finditer(r.answer or "") if "band" not in _lat(m.group(2)) for _, _, num, sup in _mention_items(m.group(1))}
     for ref in refs:
         src = srcs.get(ref.source_id)
         m = CITE_DOC_RE.search((src.url if src else "") or "")
@@ -858,7 +957,7 @@ async def link_citations(c, nid: str, r) -> str:
         out, seen = [], set()
         # tugma qo'yilgan gapda tilga olingan moddalar ("JK 266-moddasi …[3]")
         sent = re.split(r"(?<=[.!?])\s|\n", mm.string[:mm.start()])[-1]
-        named = [(a, b or "") for m2 in MENTION_RE.finditer(sent) for a, b in re.findall(r"(\d+)(?:-(\d{1,2}))?", m2.group(0).split("-modda")[0].split("-модда")[0])]
+        named = [(num, sup or "") for m2 in MENTION_RE.finditer(sent) if "band" not in _lat(m2.group(2)) for _, _, num, sup in _mention_items(m2.group(1))]
         for n in _cite_numbers(mm.group(1)):
             label, href = links.get(n, (None, None))
             if label and n in art_of and named and art_of[n][1] not in named:

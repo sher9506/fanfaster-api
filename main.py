@@ -718,6 +718,8 @@ MENTION_LAWS = [
     (r"bojxona\s+kodeks", r"bojxona kodeksi"),
     (r"shaharsozlik\s+kodeks", r"shaharsozlik kodeksi"),
     (r"konstitutsiya(?!viy)", r"respublikasi konstitutsiyasi\s*$"),   # o'zgartish qonunlari emas, Konstitutsiyaning o'zi
+    # ro'yxatda yo'q boshqa hujjat ("...to'g'risida"gi Qonunning 13-moddasi") — havola qo'yilmaydi, oldingi qonun ham olinmaydi
+    (r"[\"“”»]\s*gi\s+(?:qonun|farmon|qaror|nizom)|\b(?:qonun|farmon|qaror|nizom)(?:i|ning|iga|ida)\b", None),
 ]
 MENTION_RE = re.compile(r"((?:\d+(?:-\d{1,2})?(?:\s*,\s*|\s+va\s+|\s+hamda\s+))*)(\d+)(?:-(\d{1,2}))?(-(?:modda|модда)\w*)", re.I)
 MD_LINK_RE = re.compile(r"\[[^\]\n]{1,60}\]\(https://lex\.uz/[^)\s]+\)")
@@ -766,7 +768,7 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                     for h in re.finditer(pat, ctx):
                         if not best or h.start() > best[0]:
                             best = (h.start(), title_pat)
-                law = best[1] if best else prev_law
+                law = best[1] if best else prev_law   # best[1] None: ro'yxatda yo'q hujjat
                 prev_law = law
                 if not law:
                     continue

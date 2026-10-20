@@ -647,6 +647,18 @@ def _cite_locate(flat: str, parts: List[str]) -> Optional[int]:
     return None
 
 
+def _cite_locate_all(flat: str, parts: List[str]) -> List[int]:
+    """Iqtibos matnining barcha uchrashuvlari (47⁴ va 47⁵ kabi qo'shni moddalar deyarli bir xil yozilgan bo'ladi)."""
+    for part in sorted(parts, key=len, reverse=True):
+        if len(part) < 25:
+            break
+        key = _cite_norm(part)[:120]
+        found = [m.start() for m in re.finditer(re.escape(key), flat)]
+        if found:
+            return found
+    return []
+
+
 def _cite_article_at(flat: str, idx: int) -> Optional[tuple]:
     """Joydan oldingi eng yaqin modda sarlavhasi: ("218", "", "модда") yoki ("47", "4", "модда")."""
     heads = CITE_HEAD_RE.findall(flat[max(0, idx - 80000):idx + 15])
@@ -789,6 +801,9 @@ async def link_citations(c, nid: str, r) -> str:
     refs = [x for x in (getattr(r, "references", None) or []) if x.citation_number]
     srcs = {s.id: s for s in await c.sources.list(nid)}
     links: dict = {}
+    forced: dict = {}
+    # javobda tilga olingan moddalar: {("47", "4"), ("122", "")}
+    mentioned = {(m.group(2), m.group(3) or "") for m in MENTION_RE.finditer(r.answer or "")}
     for ref in refs:
         src = srcs.get(ref.source_id)
         m = CITE_DOC_RE.search((src.url if src else "") or "")
@@ -804,11 +819,18 @@ async def link_citations(c, nid: str, r) -> str:
                 _CITE_FULLTEXT.popitem(last=False)
         flat = _CITE_FULLTEXT[doc]
         pos = _cite_locate(flat, parts) if parts else None
+        if len(CITE_HEAD_RE.findall(flat)) >= 3 and not CITE_HEAD_RE.match(clean) and parts:
+            # bir xil matn bir necha moddada bo'lsa — javob matnida tilga olingan moddaga mos keladigan joy
+            arts = [a for a in (_cite_article_at(flat, i) for i in _cite_locate_all(flat, parts)) if a]
+            if len({a[:2] for a in arts}) > 1:
+                pick = next((a for a in arts if a[:2] in mentioned), None)
+                if pick:
+                    forced[ref.citation_number] = pick
         if len(CITE_HEAD_RE.findall(flat)) >= 3:   # kodeks/qonun (Plenum matnidagi tasodifiy "167-modda." hisobga olinmaydi)
             # Kodeks/qonun: havola modda sarlavhasiga ("#:~:text=218-модда."). Yashirin mundarija hisobga olinmaydi,
             # matndagi "218-моддаси" kabi eslatmalar nuqtasiz bo'lgani uchun mos kelmaydi.
             head = CITE_HEAD_RE.match(clean)
-            art = head.groups() if head else (_cite_article_at(flat, pos) if pos is not None else None)
+            art = head.groups() if head else forced.get(ref.citation_number) or (_cite_article_at(flat, pos) if pos is not None else None)
             frag, label = _cite_article_link(*art) if art else ("", "lex.uz")
         else:
             # Plenum, qaror va boshqa moddasiz hujjat: iqtibos qilingan gapning o'ziga

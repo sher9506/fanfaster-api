@@ -772,12 +772,14 @@ def _band_fragment(after: str, flat: str) -> str:
     sent = re.split(r"(?<=[.;:!?])\s", re.sub(r"[ʻʼ‘’`´]", "'", after.lower()), maxsplit=1)[0][:400]
     for run in re.findall(r"[^\W_]+(?:'[^\W_]+)*(?: [^\W_]+(?:'[^\W_]+)*){5,}", sent):
         words = run.split(" ")
+        def at(n: int, i: int) -> int:   # brauzer bo'lakni faqat butun so'zlar bilan topadi ("kechgan" ≠ "kechganda")
+            h = re.search(r"(?<!\w)" + re.escape(" ".join(words[i:i + n])) + r"(?!\w)", flat_ap)
+            return h.start() if h else -1
         for i in range(len(words) - 5):
-            frag = " ".join(words[i:i + 6])
-            j = flat_ap.find(frag)
+            j = at(6, i)
             if j >= 0:
                 n = 6
-                while i + n < len(words) and n < 10 and flat_ap.find(" ".join(words[i:i + n + 1])) == j:
+                while i + n < len(words) and n < 10 and at(n + 1, i) == j:
                     n += 1
                 frag = flat[j:j + len(" ".join(words[i:i + n]))]
                 return quote(frag, safe="").replace("-", "%2D")

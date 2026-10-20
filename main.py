@@ -718,7 +718,7 @@ MENTION_LAWS = [
     (r"bojxona\s+kodeks", r"bojxona kodeksi"),
     (r"shaharsozlik\s+kodeks", r"shaharsozlik kodeksi"),
 ]
-MENTION_RE = re.compile(r"((?:\d+(?:-\d{1,2})?(?:\s*,\s*|\s+va\s+|\s+hamda\s+))*)(\d+)(?:-(\d{1,2}))?(-modda\w*)", re.I)
+MENTION_RE = re.compile(r"((?:\d+(?:-\d{1,2})?(?:\s*,\s*|\s+va\s+|\s+hamda\s+))*)(\d+)(?:-(\d{1,2}))?(-(?:modda|модда)\w*)", re.I)
 MD_LINK_RE = re.compile(r"\[[^\]\n]{1,60}\]\(https://lex\.uz/[^)\s]+\)")
 
 
@@ -802,6 +802,7 @@ async def link_citations(c, nid: str, r) -> str:
     srcs = {s.id: s for s in await c.sources.list(nid)}
     links: dict = {}
     forced: dict = {}
+    art_of: dict = {}   # [N] -> (hujjat, (modda, indeks)) — gapdagi eslatma bilan solishtirish uchun
     # javobda tilga olingan moddalar: {("47", "4"), ("122", "")}
     mentioned = {(m.group(2), m.group(3) or "") for m in MENTION_RE.finditer(r.answer or "")}
     for ref in refs:
@@ -832,6 +833,8 @@ async def link_citations(c, nid: str, r) -> str:
             head = CITE_HEAD_RE.match(clean)
             art = head.groups() if head else forced.get(ref.citation_number) or (_cite_article_at(flat, pos) if pos is not None else None)
             frag, label = _cite_article_link(*art) if art else ("", "lex.uz")
+            if art:
+                art_of[ref.citation_number] = (doc, (art[0], art[1] or ""))
         else:
             # Plenum, qaror va boshqa moddasiz hujjat: iqtibos qilingan gapning o'ziga
             frag = _cite_passage(clean, flat, pos)
@@ -840,8 +843,18 @@ async def link_citations(c, nid: str, r) -> str:
 
     def repl(mm):
         out, seen = [], set()
+        # tugma qo'yilgan gapda tilga olingan moddalar ("JK 266-moddasi …[3]")
+        sent = re.split(r"(?<=[.!?])\s|\n", mm.string[:mm.start()])[-1]
+        named = [(a, b or "") for m2 in MENTION_RE.finditer(sent) for a, b in re.findall(r"(\d+)(?:-(\d{1,2}))?", m2.group(0).split("-modda")[0].split("-модда")[0])]
         for n in _cite_numbers(mm.group(1)):
             label, href = links.get(n, (None, None))
+            if label and n in art_of and named and art_of[n][1] not in named:
+                # tugma moddasi gapdagi moddaga zid: o'sha hujjatda tilga olingan modda bo'lsa — o'shani olamiz
+                doc, _ = art_of[n]
+                alt = next((x for x in named if _has_article(_CITE_FULLTEXT.get(doc, ""), x[0], x[1] or None)), None)
+                if alt:
+                    frag, label = _cite_article_link(alt[0], alt[1] or None, "модда")
+                    href = f"https://lex.uz/docs/{doc}#:~:text={frag}"
             if label and label not in seen:
                 seen.add(label)
                 out.append(f"[{label}]({href})")

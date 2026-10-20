@@ -717,6 +717,7 @@ MENTION_LAWS = [
     (r"yer\s+kodeks", r"yer kodeksi"),
     (r"bojxona\s+kodeks", r"bojxona kodeksi"),
     (r"shaharsozlik\s+kodeks", r"shaharsozlik kodeksi"),
+    (r"konstitutsiya(?!viy)", r"respublikasi konstitutsiyasi\s*$"),   # o'zgartish qonunlari emas, Konstitutsiyaning o'zi
 ]
 MENTION_RE = re.compile(r"((?:\d+(?:-\d{1,2})?(?:\s*,\s*|\s+va\s+|\s+hamda\s+))*)(\d+)(?:-(\d{1,2}))?(-(?:modda|модда)\w*)", re.I)
 MD_LINK_RE = re.compile(r"\[[^\]\n]{1,60}\]\(https://lex\.uz/[^)\s]+\)")
@@ -748,7 +749,7 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
     async def url_for(law_title: str, num: str, sup: Optional[str]) -> Optional[str]:
         for doc, sid, title in docs:
             if re.search(law_title, title) and _has_article(await flat_of(doc, sid), num, sup):
-                return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, 'модда')[0]}"
+                return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, _art_word(await flat_of(doc, sid)))[0]}"
         return None
 
     out, last = [], 0
@@ -789,11 +790,21 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
     return "".join(out)
 
 
+def _art_word(flat: str) -> str:
+    """Hujjat sarlavhalari qaysi yozuvda: lex.uz'dagi 580 ta hujjat lotinda ("1-modda."), qolgani kirillda ("1-модда.")."""
+    return "modda" if len(re.findall(r"\d ?-modda\.", flat)) > len(re.findall(r"\d ?-модда\.", flat)) else "модда"
+
+
 def _cite_doc_label(title: str, flat: str) -> str:
     """Moddasiz hujjat yorlig'i: lex.uz sarlavhasi "4-сон 21.05.2004. ..." bo'lgan Oliy sud Plenumi -> "Plenum №4"."""
     m = re.match(r"\s*(\d+)-(?:сон|son)\b", title or "")
     if m and re.search(r"пленум|plenum", flat[:6000]):
         return f"Plenum №{int(m.group(1))}"
+    # farmon/qaror/qonun: "ПФ-1663-сон" -> "PF-1663", "ЎРҚ-1036-сон" -> "O'RQ-1036", "2509-сон" / "846-XII-сон" -> "№2509" / "№846-XII"
+    m = re.match(r"\s*(\S+?)-(?:сон|son)\b", title or "")
+    if m:
+        head, _, rest = m.group(1).partition("-")
+        return f"{_lat(head).upper()}-{rest}" if rest and not head[0].isdigit() else f"№{m.group(1)}"
     return "lex.uz"
 
 
@@ -853,7 +864,7 @@ async def link_citations(c, nid: str, r) -> str:
                 doc, _ = art_of[n]
                 alt = next((x for x in named if _has_article(_CITE_FULLTEXT.get(doc, ""), x[0], x[1] or None)), None)
                 if alt:
-                    frag, label = _cite_article_link(alt[0], alt[1] or None, "модда")
+                    frag, label = _cite_article_link(alt[0], alt[1] or None, _art_word(_CITE_FULLTEXT.get(doc, "")))
                     href = f"https://lex.uz/docs/{doc}#:~:text={frag}"
             if label and label not in seen:
                 seen.add(label)

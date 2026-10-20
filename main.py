@@ -610,7 +610,9 @@ def looks_truncated(text: str) -> bool:
 # NotebookLM har [N] uchun manba (source_id) va iqtibos matnini beradi. Belgi "[217-modda](lex.uz/docs/ID#:~:text=217-модда.)"
 # havolasiga aylanadi: brauzer sahifani aynan shu modda sarlavhasiga aylantirib ochadi (text fragment).
 CITE_MARK_RE = re.compile(r"[ \t]*\[(\d+(?:\s*[-–,]\s*\d+)*)\]")
-CITE_HEAD_RE = re.compile(r"(\d+)[¹²³⁴⁵⁶⁷⁸⁹⁰]*-(модда|modda)\.", re.I)            # modda sarlavhasi ("217-модда.")
+# modda sarlavhasi: "217-модда.", kiritilgan modda NotebookLM matnida "47 4 -модда." (lex.uz'da 47⁴): (raqam, indeks, so'z)
+CITE_HEAD_RE = re.compile(r"(?<!\d)(\d+)(?: (\d{1,2}))? ?-(модда|modda)\.", re.I)
+SUP = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 CITE_NOISE_RE = re.compile(r"(?i)ҳужжатга таклиф юбориш|аудиони тинглаш|ҳужжат элементидан ҳавола олиш|"
                            r"hujjatga taklif yuborish|audioni tinglash|hujjat elementidan havola olish|"
                            r"lexuz шарҳи|lexuz sharhi|олдинги таҳрирга қаранг\.?|oldingi tahrirga qarang\.?")
@@ -646,14 +648,18 @@ def _cite_locate(flat: str, parts: List[str]) -> Optional[int]:
 
 
 def _cite_article_at(flat: str, idx: int) -> Optional[tuple]:
-    """Joydan oldingi eng yaqin modda sarlavhasi: ("218", "модда")."""
+    """Joydan oldingi eng yaqin modda sarlavhasi: ("218", "", "модда") yoki ("47", "4", "модда")."""
     heads = CITE_HEAD_RE.findall(flat[max(0, idx - 80000):idx + 15])
     return heads[-1] if heads else None
+
+
+CITE_EDIT_NOTE_RE = re.compile(r"(?i)\([^()]{0,300}?(?:tahririda|таҳририда|qaroriga asosan|қарорига асосан|o'z kuchini yo'qotgan)[^()]*\)")
 
 
 def _cite_passage(clean: str, flat: str, pos: Optional[int]) -> str:
     """Moddasiz hujjat (Plenum, qaror) uchun iqtibos qilingan gapga bo'lak. Brauzer birinchi uchrashuvga o'tadi, shuning
     uchun bo'lak iqtibos joyidan oldin uchramaguncha uzaytiriladi (6–14 so'z); bo'lmasa bo'lak qo'yilmaydi."""
+    clean = CITE_EDIT_NOTE_RE.sub(" ", clean)   # "(2-bandning … qarori tahririda)" sahifada ko'p takrorlanadi
     for run in re.findall(r"[^\W_]+(?: [^\W_]+){5,}", clean):
         words = run.split(" ")
         for n in range(6, min(14, len(words)) + 1):
@@ -666,18 +672,121 @@ def _cite_passage(clean: str, flat: str, pos: Optional[int]) -> str:
     return ""
 
 
+def _cite_article_link(num: str, sup: Optional[str], word: str) -> tuple:
+    """("47", "4", "модда") -> (text fragment "474-модда." — lex.uz'da 47⁴ shunday o'qiladi, yorliq "47⁴-modda")."""
+    frag = quote(f"{num}{sup or ''}-{word.lower()}.", safe="").replace("-", "%2D")
+    return frag, f"{num}{(sup or '').translate(SUP)}-modda"
+
+
+_CYR_LAT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяўқғҳ",
+                    ["a", "b", "v", "g", "d", "e", "yo", "j", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s", "t", "u",
+                     "f", "x", "ts", "ch", "sh", "sh", "'", "i", "", "e", "yu", "ya", "o'", "q", "g'", "h"]))
+
+
+def _lat(s: str) -> str:
+    """Sarlavhani taqqoslash uchun lotin, kichik harf, bir xil tutuq belgisi."""
+    s = re.sub(r"[ʻʼ‘’`´]", "'", (s or "").lower())
+    return "".join(_CYR_LAT.get(ch, ch) for ch in s)
+
+
+# Javobda tilga olingan qonun -> manba sarlavhasi qolipi (aniqrog'i oldin: protsessual kodekslar oddiylardan oldin)
+MENTION_LAWS = [
+    (r"fuqaro(?:lik)?\s+protsessual|\bfpk\b", r"fuqarolik protsessual"),
+    (r"jinoyat[- ]protsessual|\bjpk\b", r"jinoyat-protsessual"),
+    (r"ma'muriy\s+javobgarlik|\bmjtk\b", r"ma'muriy javobgarlik"),
+    (r"jinoyat[- ]ijroiya", r"jinoyat-ijroiya"),
+    (r"iqtisodiy\s+protsessual|\bipk\b", r"iqtisodiy protsessual"),
+    (r"fuqaro(?:lik)?\s+kodeks|\bfk\b", r"fuqarolik kodeksi"),
+    (r"jinoyat\s+kodeks|\bjk\b", r"jinoyat kodeksi"),
+    (r"mehnat\s+kodeks|\bmk\b", r"mehnat kodeksi"),
+    (r"oila\s+kodeks", r"oila kodeksi"),
+    (r"uy-joy\s+kodeks", r"uy-joy kodeksi"),
+    (r"soliq\s+kodeks", r"soliq kodeksi"),
+    (r"yer\s+kodeks", r"yer kodeksi"),
+    (r"bojxona\s+kodeks", r"bojxona kodeksi"),
+    (r"shaharsozlik\s+kodeks", r"shaharsozlik kodeksi"),
+]
+MENTION_RE = re.compile(r"((?:\d+(?:-\d{1,2})?(?:\s*,\s*|\s+va\s+|\s+hamda\s+))*)(\d+)(?:-(\d{1,2}))?(-modda\w*)", re.I)
+MD_LINK_RE = re.compile(r"\[[^\]\n]{1,60}\]\(https://lex\.uz/[^)\s]+\)")
+
+
+def _has_article(flat: str, num: str, sup: Optional[str]) -> bool:
+    pat = rf"(?<!\d){num} {sup} ?-(?:модда|modda)\." if sup else rf"(?<!\d){num}-(?:модда|modda)\."
+    return re.search(pat, flat) is not None
+
+
+async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
+    """Javob matnidagi "Fuqarolik kodeksining 1153-moddasiga", "79 va 116-moddalariga", "47-4-moddasiga" kabi eslatmalarni
+    lex.uz moddasiga havola qiladi. Qonun nomi oldingi 90 belgidan (bo'lmasa xuddi shu abzatsdagi oldingi eslatmadan)
+    olinadi; modda daftardagi o'sha qonun manbasida borligi to'liq matndan tekshiriladi (FK 1-/2-qismi shu bilan ajraladi)."""
+    docs = []
+    for s in srcs.values():
+        m = CITE_DOC_RE.search(s.url or "")
+        if m:
+            docs.append((m.group(1), s.id, _lat(getattr(s, "title", "") or "")))
+
+    async def flat_of(doc: str, sid: str) -> str:
+        if doc not in _CITE_FULLTEXT:
+            ft = await c.sources.get_fulltext(nid, sid)
+            _CITE_FULLTEXT[doc] = _cite_norm(getattr(ft, "content", "") or "")
+            while len(_CITE_FULLTEXT) > 12:
+                _CITE_FULLTEXT.popitem(last=False)
+        return _CITE_FULLTEXT[doc]
+
+    async def url_for(law_title: str, num: str, sup: Optional[str]) -> Optional[str]:
+        for doc, sid, title in docs:
+            if re.search(law_title, title) and _has_article(await flat_of(doc, sid), num, sup):
+                return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, 'модда')[0]}"
+        return None
+
+    out, last = [], 0
+    for para in re.split(r"(\n\s*\n)", text):
+        prev_law = None
+        pieces, pos = [], 0
+        for link in list(MD_LINK_RE.finditer(para)) + [None]:   # mavjud havolalar ichiga tegmaymiz
+            seg = para[pos:link.start()] if link else para[pos:]
+            res, k = [], 0
+            for m in MENTION_RE.finditer(seg):
+                ctx = _lat(seg[max(0, m.start() - 90):m.start()])
+                best = None
+                for pat, title_pat in MENTION_LAWS:
+                    for h in re.finditer(pat, ctx):
+                        if not best or h.start() > best[0]:
+                            best = (h.start(), title_pat)
+                law = best[1] if best else prev_law
+                prev_law = law
+                if not law:
+                    continue
+                items = re.findall(r"(\d+)(?:-(\d{1,2}))?(\s*,\s*|\s+va\s+|\s+hamda\s+)", m.group(1))
+                rendered = []
+                for num, sup, sep in items:
+                    u = await url_for(law, num, sup or None)
+                    tok = f"{num}-{sup}" if sup else num
+                    rendered.append((f"[{tok}]({u})" if u else tok) + sep)
+                num, sup, tail = m.group(2), m.group(3), m.group(4)
+                u = await url_for(law, num, sup)
+                tok = f"{num}-{sup}{tail}" if sup else f"{num}{tail}"
+                rendered.append(f"[{tok}]({u})" if u and len(tok) <= 40 else tok)
+                res.append(seg[k:m.start()] + "".join(rendered))
+                k = m.end()
+            pieces.append("".join(res) + seg[k:])
+            if link:
+                pieces.append(link.group(0))
+                pos = link.end()
+        out.append("".join(pieces))
+    return "".join(out)
+
+
 def _cite_doc_label(title: str, flat: str) -> str:
     """Moddasiz hujjat yorlig'i: lex.uz sarlavhasi "4-сон 21.05.2004. ..." bo'lgan Oliy sud Plenumi -> "Plenum №4"."""
     m = re.match(r"\s*(\d+)-(?:сон|son)\b", title or "")
     if m and re.search(r"пленум|plenum", flat[:6000]):
-        return f"Plenum №{m.group(1)}"
+        return f"Plenum №{int(m.group(1))}"
     return "lex.uz"
 
 
 async def link_citations(c, nid: str, r) -> str:
     refs = [x for x in (getattr(r, "references", None) or []) if x.citation_number]
-    if not refs:
-        return r.answer
     srcs = {s.id: s for s in await c.sources.list(nid)}
     links: dict = {}
     for ref in refs:
@@ -699,9 +808,8 @@ async def link_citations(c, nid: str, r) -> str:
             # Kodeks/qonun: havola modda sarlavhasiga ("#:~:text=218-модда."). Yashirin mundarija hisobga olinmaydi,
             # matndagi "218-моддаси" kabi eslatmalar nuqtasiz bo'lgani uchun mos kelmaydi.
             head = CITE_HEAD_RE.match(clean)
-            art = (head.group(1), head.group(2)) if head else (_cite_article_at(flat, pos) if pos is not None else None)
-            frag = quote(f"{art[0]}-{art[1].lower()}.", safe="").replace("-", "%2D") if art else ""
-            label = f"{art[0]}-modda" if art else "lex.uz"
+            art = head.groups() if head else (_cite_article_at(flat, pos) if pos is not None else None)
+            frag, label = _cite_article_link(*art) if art else ("", "lex.uz")
         else:
             # Plenum, qaror va boshqa moddasiz hujjat: iqtibos qilingan gapning o'ziga
             frag = _cite_passage(clean, flat, pos)
@@ -716,7 +824,12 @@ async def link_citations(c, nid: str, r) -> str:
                 seen.add(label)
                 out.append(f"[{label}]({href})")
         return (" " + ", ".join(out)) if out else ""
-    return CITE_MARK_RE.sub(repl, r.answer)
+    text = CITE_MARK_RE.sub(repl, r.answer)
+    try:
+        text = await link_mentions(c, nid, text, srcs)
+    except Exception as e:   # noqa: BLE001 -- eslatma havolalarisiz ham javob to'liq
+        print(f"[cite] matndagi moddalar havolasiz qoldi: {str(e)[:200]}", flush=True)
+    return text
 
 
 def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Optional[str] = None,

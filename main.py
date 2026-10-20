@@ -819,6 +819,72 @@ def _band_match(ctx: str, flat: str) -> tuple:
     return "", -1
 
 
+# Kodeks/qonun moddasi ichidagi qism va bandlar: NotebookLM matnida "1)", "2)" raqamlari yo'q (bot taxmin qiladi), shuning uchun
+# lex.uz sahifalaridan jadval yig'ilgan: article_points/<doc>.json = {"161": [[qism boshi, [[2, "2) технологиянинг …"], …]], …], "47_4": …}.
+# Har hujjat jadvali faqat kerak bo'lganda o'qiladi (oxirgi 12 tasi xotirada).
+ARTICLE_POINTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "article_points")
+_ART_POINTS: OrderedDict = OrderedDict()
+ORD_LAT = ["birinchi", "ikkinchi", "uchinchi", "to'rtinchi", "beshinchi", "oltinchi", "yettinchi", "sakkizinchi",
+           "to'qqizinchi", "o'ninchi"]
+ORD_CYR = ["биринчи", "иккинчи", "учинчи", "тўртинчи", "бешинчи", "олтинчи", "еттинчи", "саккизинчи", "тўққизинчи", "ўнинчи"]
+_ORD_NUM = {w: i + 1 for i, w in enumerate(ORD_LAT)} | {"ettinchi": 7}
+# "161-moddasi| ikkinchi qismining 2-bandi", "| 2-qismi", "|ning 2-bandi", "| birinchi qismi, 1-bandi"
+PART_RE = re.compile(r"(\s+(?:(\S+)\s+(?:qism|қисм)\w*|(\d{1,2})-(?:qism|қисм)\w*))?(?:(\s*,?\s*)(\d{1,2})-(?:band|банд)\w*)?", re.I)
+
+
+def _article_points(doc: str) -> dict:
+    if doc not in _ART_POINTS:
+        try:
+            with open(os.path.join(ARTICLE_POINTS_DIR, f"{doc}.json"), encoding="utf-8") as f:
+                _ART_POINTS[doc] = json.load(f)
+        except (OSError, ValueError):
+            _ART_POINTS[doc] = {}
+        while len(_ART_POINTS) > 12:
+            _ART_POINTS.popitem(last=False)
+    return _ART_POINTS[doc]
+
+
+def _words_re(words: str):
+    """Jadvaldagi so'zlarni NotebookLM matnida qidirish qolipi (apostrof bir xil, so'zlar orasida havola manzili bo'lishi mumkin)."""
+    return re.compile(r"\s(?:https?://\S+\s)?".join(map(re.escape, _AP_RE.sub("'", words.lower()).split())))
+
+
+def _part_positions(flat: str, num: str, sup: Optional[str], parts: list) -> tuple:
+    """Modda chegarasi (bosh, oxir) va undagi har qism/band boshi: [(joy, qism, band yoki 0)]."""
+    heads = list(re.finditer(rf"(?<!\d){num} {sup} ?-(?:модда|modda)\." if sup else rf"(?<!\d){num}-(?:модда|modda)\.", flat))
+    if not heads:
+        return None
+    h = heads[-1]   # oxirgisi — mundarija emas, asosiy matn
+    nxt = CITE_HEAD_RE.search(flat, h.end())
+    end = nxt.start() if nxt else len(flat)
+    flat_ap, out, at = _AP_RE.sub("'", flat), [], h.end()
+    for q, (qf, bands) in enumerate(parts, 1):
+        for b, words in [(0, qf)] + [(n, re.sub(r"^\d{1,2}\)\s*", "", bf or "")) for n, bf in bands]:
+            if not words:
+                continue
+            m = _words_re(words).search(flat_ap, at, end)
+            if m:
+                out.append((m.start(), q, b))
+                at = m.start() + 1
+    return h.start(), end, out
+
+
+def _part_fix(phrase: str, pm, q: Optional[int], b: Optional[int]) -> str:
+    """Matndagi qism/band raqamini to'g'risiga almashtiradi ("ikkinchi qismining 2-bandi" -> "uchinchi qismining 1-bandi")."""
+    out, last = [], 0
+    if pm.group(2) and q:
+        cyr = re.search(r"[а-яўқғҳ]", pm.group(2), re.I)
+        out += [phrase[last:pm.start(2) - pm.start()], (ORD_CYR if cyr else ORD_LAT)[q - 1]]
+        last = pm.end(2) - pm.start()
+    elif pm.group(3) and q:
+        out += [phrase[last:pm.start(3) - pm.start()], str(q)]
+        last = pm.end(3) - pm.start()
+    if pm.group(5) and b:
+        out += [phrase[last:pm.start(5) - pm.start()], str(b)]
+        last = pm.end(5) - pm.start()
+    return "".join(out) + phrase[last:]
+
+
 def _band_context(para: str, a: int, b: int) -> str:
     """Band eslatmasi haqidagi gap: eslatmadan keyingi qism (keyingi band eslatmasigacha), u qisqa bo'lsa — oldingi qism."""
     after = re.split(r"(?<=[.!?])\s|\n", MD_LINK_LABEL_RE.sub(r"\1", para[b:]), maxsplit=1)[0]
@@ -870,7 +936,8 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
 
     words = {}
 
-    async def article_url(law, num: str, sup: Optional[str]) -> Optional[str]:
+    async def article_doc(law, num: str, sup: Optional[str]) -> Optional[tuple]:
+        """Moddasi bor hujjat: (doc, to'liq matn) yoki None."""
         for doc, sid, _, stitle, _ in docs:
             if law[0] == "law" and not re.search(law[1] + r"(?: \([^)]*\))?\s*$", stitle):
                 continue
@@ -880,10 +947,66 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 return None
             flat = await flat_of(doc, sid)
             if _has_article(flat, num, sup):
-                if doc not in words:   # yozuvni hujjatga bir marta aniqlaymiz (1,4 MB matnni har eslatmada qayta sanamaslik uchun)
-                    words[doc] = _art_word(flat)
-                return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, words[doc])[0]}"
+                return doc, flat
         return None
+
+    async def article_url(law, num: str, sup: Optional[str]) -> Optional[str]:
+        found = await article_doc(law, num, sup)
+        if not found:
+            return None
+        doc, flat = found
+        if doc not in words:   # yozuvni hujjatga bir marta aniqlaymiz (1,4 MB matnni har eslatmada qayta sanamaslik uchun)
+            words[doc] = _art_word(flat)
+        return f"https://lex.uz/docs/{doc}#:~:text={_cite_article_link(num, sup, words[doc])[0]}"
+
+    async def part_url(law, num: str, sup: Optional[str], q: Optional[int], b: Optional[int], ctx: str, can_fix: bool) -> tuple:
+        """Modda ichidagi qism/band havolasi: (havola yoki None, to'g'ri (qism, band) yoki None). Bot keltirgan gap boshqa
+        qism/bandda aynan uchrasa — raqamini adashtirgan, o'shanisi olinadi."""
+        found = await article_doc(law, num, sup)
+        if not found:
+            return None, None
+        doc, flat = found
+        parts = _article_points(doc).get(num + (f"_{sup}" if sup else ""))
+        if not parts:
+            return None, None
+        if q is None:   # "161-moddasining 2-bandi": o'sha raqamli band faqat bitta qismda bo'lsa
+            qs = [i + 1 for i, (_, bands) in enumerate(parts) if any(n == b for n, _ in bands)]
+            if len(qs) != 1:
+                return None, None
+            q = qs[0]
+
+        def frag(q: int, b: Optional[int]) -> Optional[str]:
+            if not 1 <= q <= len(parts):
+                return None
+            qf, bands = parts[q - 1]
+            return next((bf for n, bf in bands if n == b), None) if b else qf
+        fix = None
+        span = _part_positions(flat, num, sup, parts) if can_fix else None
+        if span:
+            s0, e0, pos = span
+            # bot lotincha yozadi, kodeks ko'pincha kirillda: faqat shu modda bo'lagini lotinga o'girib solishtiramiz
+            reg, idx = [], []
+            for i, ch in enumerate(flat[s0:e0]):
+                t = _lat(ch)
+                reg.append(t)
+                idx += [s0 + i] * len(t)
+            text, jj = _band_match(_lat(ctx), "".join(reg))
+            if jj >= 0:
+                j = idx[jj]
+                hits = [idx[h.start()] for h in re.finditer(re.escape(text), "".join(reg))]
+                own = [i for i, (p, qq, bb) in enumerate(pos) if qq == q and bb == (b or 0)]
+                in_own = False
+                if own:
+                    p0 = pos[own[0]][0]
+                    nxt = next((p for p, qq, bb in pos[own[0] + 1:] if bb == 0 or b), e0)
+                    in_own = any(p0 <= h < nxt for h in hits)
+                real = next(((qq, bb) for p, qq, bb in reversed(pos) if p <= j), None)
+                if not in_own and real and (real[0], real[1] if b else 0) != (q, b or 0) and (real[1] or not b):
+                    fix = (real[0], real[1] or None)
+        target = frag(*fix) if fix else frag(q, b)
+        if not target:
+            return None, None
+        return f"https://lex.uz/docs/{doc}#:~:text={quote(target, safe='').replace('-', '%2D')}", fix
 
     async def band_url(law, num: str, ctx: str, single: bool) -> tuple:
         """(havola, to'g'ri band raqami yoki None). Bot keltirgan gap boshqa bandda bo'lsa (raqamni adashtirgan) — o'sha band."""
@@ -923,6 +1046,8 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
             seg = para[pos:link.start()] if link else para[pos:]
             res, k = [], 0
             for m in MENTION_RE.finditer(seg):
+                if m.start() < k:   # qism/band iborasi ichidagi "2-bandi" — allaqachon havola qilingan
+                    continue
                 before = re.sub(r"\[([^\]\n]*)\]\([^)\s]*\)", r"\1", para[:pos] + seg[:m.start()])[-200:]
                 ctx = _law_norm(before)
                 found = resolve(ctx)
@@ -953,8 +1078,25 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                         u = await article_url(law, num, sup)
                     rendered.append(nums[at:s] + (f"[{tok}]({u})" if u and len(tok) <= 40 else tok))
                     at = e
+                end = m.end()
+                pm = None if is_band else PART_RE.match(seg, m.end())
+                if pm and (pm.group(1) or pm.group(5)):
+                    q = _ORD_NUM.get(_lat(pm.group(2))) if pm.group(2) else (int(pm.group(3)) if pm.group(3) else None)
+                    bn = int(pm.group(5)) if pm.group(5) else None
+                    if not (pm.group(2) and q is None):   # tanilmagan so'z ("va qismi") — qism emas
+                        num, sup = items[-1][2], items[-1][3]
+                        u, fix = await part_url(law, num, sup, q, bn, _band_context(para, pos + pm.start(), pos + pm.end()),
+                                                len(items) == 1)
+                        lead = len(pm.group(0)) - len(pm.group(0).lstrip())
+                        phrase = seg[pm.start():pm.end()]
+                        if fix:
+                            phrase = _part_fix(phrase, pm, fix[0] if (pm.group(2) or pm.group(3)) else None, fix[1])
+                        head, body = (phrase[:lead], phrase[lead:]) if lead else ("", phrase)
+                        if u and body.strip() and len(body) <= 40:
+                            rendered.append(head + f"[{body}]({u})")
+                            end = pm.end()
                 res.append(seg[k:m.start()] + "".join(rendered))
-                k = m.end()
+                k = end
             pieces.append("".join(res) + seg[k:])
             if link:
                 pieces.append(link.group(0))

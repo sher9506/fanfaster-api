@@ -607,10 +607,10 @@ def looks_truncated(text: str) -> bool:
 
 
 # ── [N] iqtiboslar -> lex.uz moddasiga havola (faqat so'rovda citations=True bo'lsa) ──
-# NotebookLM har [N] uchun manba (source_id) va iqtibos matnini beradi. Belgi "[217-modda](lex.uz/docs/ID#:~:text=...)"
-# havolasiga aylanadi: brauzer sahifani aynan shu gapga aylantirib, uni belgilab ochadi (text fragment).
+# NotebookLM har [N] uchun manba (source_id) va iqtibos matnini beradi. Belgi "[217-modda](lex.uz/docs/ID#:~:text=217-модда.)"
+# havolasiga aylanadi: brauzer sahifani aynan shu modda sarlavhasiga aylantirib ochadi (text fragment).
 CITE_MARK_RE = re.compile(r"[ \t]*\[(\d+(?:\s*[-–,]\s*\d+)*)\]")
-CITE_HEAD_RE = re.compile(r"(\d+)[¹²³⁴⁵⁶⁷⁸⁹⁰]*-(?:модда|modda)\.", re.I)          # modda sarlavhasi ("217-модда.")
+CITE_HEAD_RE = re.compile(r"(\d+)[¹²³⁴⁵⁶⁷⁸⁹⁰]*-(модда|modda)\.", re.I)            # modda sarlavhasi ("217-модда.")
 CITE_NOISE_RE = re.compile(r"(?i)ҳужжатга таклиф юбориш|аудиони тинглаш|ҳужжат элементидан ҳавола олиш|"
                            r"hujjatga taklif yuborish|audioni tinglash|hujjat elementidan havola olish|"
                            r"lexuz шарҳи|lexuz sharhi|олдинги таҳрирга қаранг\.?|oldingi tahrirga qarang\.?")
@@ -630,56 +630,83 @@ def _cite_numbers(group: str) -> List[int]:
     return out
 
 
-def _cite_fragment(clean: str) -> str:
-    """Iqtibosdan sahifada aynan topiladigan 4–7 so'zlik bo'lak (bloklar orasi bo'shliqsiz yopishgan so'zlar tashlanadi)."""
-    for run in re.findall(r"[^\W_]+(?: [^\W_]+){3,}", clean):
-        words = []
-        for w in run.split(" "):
-            if re.search(r"\d", w) and re.search(r"[^\W\d_]", w):   # "таътиллар408" — ikki blok yopishgan
-                break
-            words.append(w)
-        if len(words) >= 4:
-            return quote(" ".join(words[:7]), safe="").replace("-", "%2D")
-    return ""
+def _cite_norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
 
 
-def _cite_article(fulltext: str, parts: List[str]) -> Optional[str]:
-    """Iqtibos bo'lagini to'liq matndan topib (oxirgi uchrashuv — mundarija emas, asosiy matn), undan oldingi modda sarlavhasi."""
+def _cite_locate(flat: str, parts: List[str]) -> Optional[int]:
+    """Iqtibosning to'liq matndagi joyi (oxirgi uchrashuv — mundarija emas, asosiy matn)."""
     for part in sorted(parts, key=len, reverse=True):
         if len(part) < 25:
             break
-        idx = fulltext.rfind(part[:120])
+        idx = flat.rfind(_cite_norm(part)[:120])
         if idx >= 0:
-            heads = CITE_HEAD_RE.findall(fulltext[max(0, idx - 80000):idx + 15])
-            return heads[-1] if heads else None
+            return idx
     return None
+
+
+def _cite_article_at(flat: str, idx: int) -> Optional[tuple]:
+    """Joydan oldingi eng yaqin modda sarlavhasi: ("218", "модда")."""
+    heads = CITE_HEAD_RE.findall(flat[max(0, idx - 80000):idx + 15])
+    return heads[-1] if heads else None
+
+
+def _cite_passage(clean: str, flat: str, pos: Optional[int]) -> str:
+    """Moddasiz hujjat (Plenum, qaror) uchun iqtibos qilingan gapga bo'lak. Brauzer birinchi uchrashuvga o'tadi, shuning
+    uchun bo'lak iqtibos joyidan oldin uchramaguncha uzaytiriladi (6–14 so'z); bo'lmasa bo'lak qo'yilmaydi."""
+    for run in re.findall(r"[^\W_]+(?: [^\W_]+){5,}", clean):
+        words = run.split(" ")
+        for n in range(6, min(14, len(words)) + 1):
+            frag = _cite_norm(" ".join(words[:n]))
+            i = flat.find(frag)
+            if i < 0:
+                break
+            if pos is None or abs(i - pos) <= len(clean) + 50:
+                return quote(frag, safe="").replace("-", "%2D")
+    return ""
+
+
+def _cite_doc_label(title: str, flat: str) -> str:
+    """Moddasiz hujjat yorlig'i: lex.uz sarlavhasi "4-сон 21.05.2004. ..." bo'lgan Oliy sud Plenumi -> "Plenum №4"."""
+    m = re.match(r"\s*(\d+)-(?:сон|son)\b", title or "")
+    if m and re.search(r"пленум|plenum", flat[:6000]):
+        return f"Plenum №{m.group(1)}"
+    return "lex.uz"
 
 
 async def link_citations(c, nid: str, r) -> str:
     refs = [x for x in (getattr(r, "references", None) or []) if x.citation_number]
     if not refs:
         return r.answer
-    urls = {s.id: (s.url or "") for s in await c.sources.list(nid)}
+    srcs = {s.id: s for s in await c.sources.list(nid)}
     links: dict = {}
     for ref in refs:
-        m = CITE_DOC_RE.search(urls.get(ref.source_id, ""))
+        src = srcs.get(ref.source_id)
+        m = CITE_DOC_RE.search((src.url if src else "") or "")
         if not m:
             continue
         doc = m.group(1)
         parts = [x.strip() for x in CITE_NOISE_RE.split(ref.cited_text or "") if x.strip()]
         clean = re.sub(r"\s+", " ", " ".join(parts))
-        head = CITE_HEAD_RE.match(clean)
-        art = head.group(1) if head else None
-        if not art and parts:
-            if doc not in _CITE_FULLTEXT:
-                ft = await c.sources.get_fulltext(nid, ref.source_id)
-                _CITE_FULLTEXT[doc] = getattr(ft, "content", "") or ""
-                while len(_CITE_FULLTEXT) > 12:
-                    _CITE_FULLTEXT.popitem(last=False)
-            art = _cite_article(_CITE_FULLTEXT[doc], parts)
-        frag = _cite_fragment(clean)
-        links[ref.citation_number] = (f"{art}-modda" if art else "lex.uz",
-                                      f"https://lex.uz/docs/{doc}" + (f"#:~:text={frag}" if frag else ""))
+        if doc not in _CITE_FULLTEXT:
+            ft = await c.sources.get_fulltext(nid, ref.source_id)
+            _CITE_FULLTEXT[doc] = _cite_norm(getattr(ft, "content", "") or "")
+            while len(_CITE_FULLTEXT) > 12:
+                _CITE_FULLTEXT.popitem(last=False)
+        flat = _CITE_FULLTEXT[doc]
+        pos = _cite_locate(flat, parts) if parts else None
+        if len(CITE_HEAD_RE.findall(flat)) >= 3:   # kodeks/qonun (Plenum matnidagi tasodifiy "167-modda." hisobga olinmaydi)
+            # Kodeks/qonun: havola modda sarlavhasiga ("#:~:text=218-модда."). Yashirin mundarija hisobga olinmaydi,
+            # matndagi "218-моддаси" kabi eslatmalar nuqtasiz bo'lgani uchun mos kelmaydi.
+            head = CITE_HEAD_RE.match(clean)
+            art = (head.group(1), head.group(2)) if head else (_cite_article_at(flat, pos) if pos is not None else None)
+            frag = quote(f"{art[0]}-{art[1].lower()}.", safe="").replace("-", "%2D") if art else ""
+            label = f"{art[0]}-modda" if art else "lex.uz"
+        else:
+            # Plenum, qaror va boshqa moddasiz hujjat: iqtibos qilingan gapning o'ziga
+            frag = _cite_passage(clean, flat, pos)
+            label = _cite_doc_label(getattr(src, "title", "") or "", flat)
+        links[ref.citation_number] = (label, f"https://lex.uz/docs/{doc}" + (f"#:~:text={frag}" if frag else ""))
 
     def repl(mm):
         out, seen = [], set()

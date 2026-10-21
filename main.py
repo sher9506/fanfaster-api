@@ -765,6 +765,8 @@ MENTION_SAME_RE = re.compile(r"\b(?:shu|ushbu|mazkur)\s+(?:qonun|kodeks|qaror|fa
 LAW_NAME_TAIL_RE = re.compile(r"\s*(?:gi\s+)?(?:qonun|kodeks|farmon|qaror|nizom)\w*")
 PLENUM_REF_RE = re.compile(r"plenum\w*\s+(?:(\d{4})-yil\s+)?(?:\S+\s+){0,4}?(\d+)-son\w*(?:\s+qaror\w*)?"
                            r"|(\d+)-son\w*\s+(?:\S+\s+){0,3}?plenum\w*(?:\s+qaror\w*)?")
+# raqamsiz "Plenum qarorining 39-bandi" — javob manbalarida bitta Plenum bo'lsa, o'sha
+PLENUM_ANY_RE = re.compile(r"plenum\w*(?:\s+\S+){0,2}?\s+qaror\w*")
 UNSUP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
 MENTION_RE = re.compile(r"(?<!\d)(?<!\d\.)((?:\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*(?:\s*,\s*|\s+va\s+|\s+hamda\s+|\s*[–—]\s*|-))*\d+[⁰¹²³⁴⁵⁶⁷⁸⁹]*)"
                         r"((?:-|\s)(?:modda|модда|band|банд)\w*)", re.I)
@@ -973,6 +975,7 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                     cands.append((t.end() if t else h.end(), 2, ("doc", doc, sid)))
         for h in PLENUM_REF_RE.finditer(ctx):
             cands.append((h.end(), 2, ("plenum", h.group(2) or h.group(3), h.group(1))))
+        cands += [(h.end(), 1, ("plenum_any",)) for h in PLENUM_ANY_RE.finditer(ctx)]
         cands += [(h.end(), 1, ("same",)) for h in MENTION_SAME_RE.finditer(ctx)]
         cands += [(h.end(), 0, ("other",)) for h in MENTION_OTHER_RE.finditer(ctx)]
         return max(cands)[2] if cands else None
@@ -1053,6 +1056,12 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
 
     async def band_url(law, num: str, ctx: str, single: bool) -> tuple:
         """(havola, to'g'ri band raqami yoki None). Bot keltirgan gap boshqa bandda bo'lsa (raqamni adashtirgan) — o'sha band."""
+        if law[0] == "plenum_any":
+            plenums = [doc for doc, sid, title, _, _ in docs
+                       if re.match(r"\s*\d+-son\b", title) and _cite_doc_label(title, await flat_of(doc, sid)).startswith("Plenum")]
+            if len(plenums) != 1:
+                return None, None
+            law = ("doc", plenums[0], None)
         for doc, sid, title, _, _ in docs:
             if law[0] == "doc" and doc != law[1]:
                 continue
@@ -1077,6 +1086,8 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 if flat.find(text, starts[0], end) >= 0:
                     return base + f"#:~:text={own}", None
             real = next((k for p, k in reversed(pos) if p <= j), None)
+            if not single and real is not None and real != n:   # ro'yxatdagi band raqamini tuzatib bo'lmaydi — o'z boshiga
+                return base + (f"#:~:text={own}" if own else ""), None
             frag = quote(text, safe="").replace("-", "%2D")
             return base + f"#:~:text={frag}", (real if single and real is not None and real != n else None)
         return None, None
@@ -1099,7 +1110,7 @@ async def link_mentions(c, nid: str, text: str, srcs: dict) -> str:
                 if is_band:
                     if re.search(r"(?:modda|qism)\w*[\s,]*(?:\S+\s+){0,3}$", ctx):   # "547-moddasi birinchi qismi 1-bandi"
                         continue
-                    law = found if found and found[0] in ("plenum", "doc") else prev_band
+                    law = found if found and found[0] in ("plenum", "plenum_any", "doc") else prev_band
                     prev_band = law
                 else:
                     law = prev_art if found is None or found[0] == "same" else found

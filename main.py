@@ -1244,7 +1244,21 @@ async def link_citations(c, nid: str, r) -> str:
         text = await link_mentions(c, nid, text, srcs)
     except Exception as e:   # noqa: BLE001 -- eslatma havolalarisiz ham javob to'liq
         print(f"[cite] matndagi moddalar havolasiz qoldi: {str(e)[:200]}", flush=True)
-    return text
+    return text + _verify_footer(text)
+
+
+def _verify_footer(text: str) -> str:
+    """Javob oxiridagi ishonch qatori: nechta iqtibos lex.uz havolasi bilan tasdiqlangani va
+    havolasiz qolgan (manbada topilmagan) band raqamlari soni. Havola yo'q bo'lsa — qator ham yo'q."""
+    verified = len(set(re.findall(r"\]\((https://lex\.uz/[^)\s]+)\)", text)))
+    if not verified:
+        return ""
+    plain = re.sub(r"\[[^\]\n]*\]\([^)\s]*\)", " ", text)           # havolali joylar hisobga olinmaydi
+    unverified = len(re.findall(r"\b\d+-band\w*", plain))
+    line = f"\n\n✅ {verified} ta iqtibos lex.uz bilan tekshirildi"
+    if unverified:
+        line += f" · ⚠ {unverified} ta band raqami tasdiqlanmadi"
+    return line + "."
 
 
 def _ask_cmd(p: str, nid: str, prompt: str, backend: Optional[str], conv_id: Optional[str] = None,

@@ -519,6 +519,39 @@ def strip_leaks(txt: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(res)).strip()
 
 
+# Gemini (NotebookLM) ba'zan ichki "fikrlash"ini javobga qo'shib yuboradi: inglizcha reja/tekshiruv qatorlari
+# ("Let's break down…", "Let's re-verify all instructions…") va prompt qoidalarining iqtiboslari.
+THINK_RE = re.compile(r"\blet'?s\s+(?:break|re-?verify|verify|check|double-check|review|think|analy[sz]e|draft|start|"
+                      r"outline|go|look|recap|construct|refine|ensure)\b|\binstructions and constraints\b|\bself-correction\b|"
+                      r"\bfinal (?:check|review|polish)\b|\bconstraint checklist\b|\bconfidence score\b", re.I)
+EN_WORD_RE = re.compile(r"\b(?:the|and|of|to|is|are|this|that|with|for|all|let's|we|must|should|answer|question|user|"
+                        r"check|instructions?|constraints?|output|draft|format|response|ensure)\b", re.I)
+# butun qator qo'shtirnoq ichidagi prompt qoidasi ("- \"MUHIM QOIDA: …\""); qonun nomi bilan boshlanadigan oddiy gap emas
+RULE_QUOTE_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*[\"“«].*(?:yozing|bermang|qilmang|yozmang|tugating|huquqshunos|kirill harf|"
+                           r"taklif qilish|qisqa xulosa, keyin|MUHIM|QOIDA|ANIQLIK|LOTIN).*[\"”»][.,]?\s*$")
+
+
+def _is_english(ln: str) -> bool:
+    words = re.findall(r"[A-Za-z']+", ln)
+    return len(words) >= 4 and len(EN_WORD_RE.findall(ln)) >= max(2, len(words) * 0.25)
+
+
+def strip_thinking(txt: str) -> str:
+    """Inglizcha "fikrlash" qatorlari va prompt iqtiboslari olib tashlanadi; oddiy javobga tegilmaydi."""
+    lines = txt.splitlines()
+    if not (THINK_RE.search(txt) or any(_is_english(ln) or RULE_QUOTE_RE.search(ln) for ln in lines)):
+        return txt
+    heads = [m.start() for m in re.finditer(r"^[#*\s]*qisqa xulosa", txt, re.I | re.M)]
+    if heads and THINK_RE.search(txt[:heads[-1]]) and not THINK_RE.search(txt[heads[-1]:]):
+        lines = txt[heads[-1]:].splitlines()          # fikrlashdan keyin to'liq javob kelgan: o'shandan boshlab
+    kept = [ln for ln in lines if not (THINK_RE.search(ln) or _is_english(ln) or RULE_QUOTE_RE.search(ln))]
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if not out:
+        return txt
+    print(f"[think] fikrlash matni olib tashlandi: {len(txt) - len(out)} belgi", flush=True)
+    return out
+
+
 def clean_answer(raw: str, custom: bool = False) -> str:
     lines = [
         ln for ln in raw.splitlines()
@@ -540,7 +573,7 @@ def clean_answer(raw: str, custom: bool = False) -> str:
     if CLEAN_MARKDOWN:
         txt = strip_markdown(txt)
     txt = strip_trailing_offer(txt)
-    txt = strip_leaks(txt)
+    txt = strip_thinking(strip_leaks(txt))
     return BRAND_RE.sub("", txt)
 
 

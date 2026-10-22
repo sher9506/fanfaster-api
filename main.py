@@ -161,6 +161,37 @@ LATIN_RULE = (
     "\nJavobni to'liq o'zbek LOTIN yozuvida yozing. Manba kirill yozuvida bo'lsa ham, undagi iboralarni lotin alifbosiga o'tkazib yozing; "
     "javobda kirill harflari bo'lmasin."
 )
+# NASHER_RU_ANSWER=1 -> ruscha savolga ruscha javob. O'chiq bo'lsa yoki savol ruscha deb aniqlanmasa — prompt harfma-harf eskicha.
+RU_ANSWER = os.environ.get("NASHER_RU_ANSWER", "").strip() == "1"
+RU_RULE = (
+    "\nОтвечай полностью на русском языке (кириллицей), даже если инструкция выше написана на узбекском: "
+    "структура, полнота и точность ответа — те же. Статьи называй «статья N», цитаты из источников приводи на русском. "
+    "Фразы, которые инструкция требует написать дословно (например, что вопрос в законодательстве прямо не урегулирован "
+    "или что в источнике это точно не указано), переведи на русский."
+)
+# Ruscha savolni aniqlash: shubha bo'lsa — O'ZBEKCHA (o'zbekcha javob sifati hech qachon o'zgarmasin)
+UZ_CYR_RE = re.compile(r"[ўқғҳЎҚҒҲ]")
+_W = r"(?<![а-яёa-z])(?:%s)(?![а-яёa-z])"
+RU_WORDS_RE = re.compile(_W % "что|как|если|это|меня|мне|можно|нужно|ли|не|и|в|на|с|по|за|от|я|он|она|мы|они|его|её|их|мой|моя|мою|был|была|были|при|после|который|которая|для|без|или|но|уже|чтобы|когда|почему|какой|какие|сколько|где|есть|нет|может|должен|ребенок|ребёнок|работодатель|договор|закон|статья|суд", re.I)
+UZ_WORDS_RE = re.compile(_W % "ва|билан|учун|нима|нега|кандай|канча|булади|болади|бўлади|керак|мумкин|эмас|бор|йук|мен|сен|биз|бу|шу|агар|лекин|аммо|ёки|деб|хам|булса|болса|килиш|килса|килади|килинади|беринг|айтиб|бер|мени|менга|сизга|нафар|ишдан|килай|борми|йукми|тугрисида|модда|моддаси|кодекси|конуни|ариза", re.I)
+RU_VERB_RE = re.compile(r"[а-яё]{3,}(?:ть|ться|ешь|ется|ются)(?![а-яё])", re.I)
+RU_ONLY_RE = re.compile(r"[ыщЫЩ]")   # o'zbek kirill alifbosida yo'q
+
+
+def is_russian(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    if not letters or UZ_CYR_RE.search(text):
+        return False
+    cyr = sum("Ѐ" <= c <= "ӿ" for c in letters)
+    if cyr / len(letters) <= 0.5 or UZ_WORDS_RE.search(text):
+        return False
+    return len(RU_WORDS_RE.findall(text)) + len(RU_VERB_RE.findall(text)) + 2 * len(RU_ONLY_RE.findall(text)) >= 2
+
+
+def lang_rule(question: str) -> str:
+    return RU_RULE if RU_ANSWER and is_russian(question) else LATIN_RULE
+
+
 ACCURACY_RULE = (
     "\n\nANIQLIK: Modda, qism va band raqamlarini faqat manbadagi matndan tekshirib yozing, xotiradan yozmang. "
     "Manbada aniq topilmasa, taxmin qilmang, 'manbada aniq ko'rsatilmagan' deb yozing. "
@@ -455,7 +486,7 @@ def is_oversize_error(msg: str) -> bool:
 STALL_WORDS = ("deadline_exceeded", "deadline exceeded", "timeout", "timed out")
 TERMINAL_CHARS = ".!?…»”\"')*"
 CITATION_TAIL_RE = re.compile(r"(?:\s*\[\d+(?:[\s,\-–]+\d+)*\])+\s*$")
-CONCLUSION_WORDS = ("xulosa", "conclusion")
+CONCLUSION_WORDS = ("xulosa", "conclusion", "вывод", "заключение")
 CONTINUE_DONE = "TUGADI"
 CONTINUE_PROMPT = (
     "Oldingi javobingiz oxirigacha yetmay uzilib qoldi. Aynan uzilgan joyidan davom ettiring: "
@@ -570,7 +601,7 @@ def join_answers(answers: List[str]) -> str:
     return "\n".join(parts)
 
 
-def recover_answer(p: str, nid: str, step, base: int = 0) -> str:
+def recover_answer(p: str, nid: str, step, base: int = 0, rule: str = LATIN_RULE) -> str:
     """`ask` timeout bilan tugagach: javobni NotebookLM tarixidan oladi, qirqilgan bo'lsa shu suhbatda davom ettirtiradi.
     HEAVY_ASK_SEM ichida chaqirilmaydi (kutish boshqa savollarni to'smasin); davomga so'rov yuborilganda semafor qisqa olinadi."""
     step("ask timeout berdi, javob tarixdan qidirilmoqda")
@@ -587,7 +618,7 @@ def recover_answer(p: str, nid: str, step, base: int = 0) -> str:
         try:
             with HEAVY_ASK_SEM:
                 with MemWatch(f"continue={nid[:8]}"):
-                    _ask_cmd(p, nid, CONTINUE_PROMPT.replace("{tail}", tail) + NO_QUESTION_RULE + LATIN_RULE,
+                    _ask_cmd(p, nid, CONTINUE_PROMPT.replace("{tail}", tail) + NO_QUESTION_RULE + rule,
                              CUSTOM_ASK_BACKEND or None, conv_id=conv_id)
         except AskStalled:
             step("davom ham timeout berdi, natija tarixdan olinadi")
@@ -619,7 +650,7 @@ def build_prompt(req: "KazusRequest") -> str:
     tpl = req.instruction or DEFAULT_PROMPT
     if "{kazus}" not in tpl:
         tpl = tpl + "\n\nKAZUS MATNI:\n{kazus}"
-    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE + LATIN_RULE + ACCURACY_RULE + PRIVACY_RULE
+    return tpl.replace("{kazus}", req.kazus_text) + NO_QUESTION_RULE + lang_rule(req.kazus_text) + ACCURACY_RULE + PRIVACY_RULE
 
 
 def mem_mb() -> str:
@@ -884,7 +915,7 @@ def run_job(job: dict, acc: dict) -> dict:
                         stalled = e
             if stalled is not None:   # semafordan tashqarida: tarixni kutish boshqa savollarni to'smaydi
                 print(f"[stall] job={jid} {p}: {str(stalled)[:150]}", flush=True)
-                raw = recover_answer(p, nid, step, base=req.prior_turns if reuse else 0)
+                raw = recover_answer(p, nid, step, base=req.prior_turns if reuse else 0, rule=lang_rule(req.kazus_text))
         else:
             ask_args = ["ask", "--notebook", nid] + (["--new", "--yes"] if RAW_MODE else []) + [prompt]
             ask = lambda: nlm(p, *ask_args, timeout=420, backend=ASK_BACKEND or None)
